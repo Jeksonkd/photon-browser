@@ -25,6 +25,10 @@
 #include <string>
 #include <vector>
 
+// App/window icon, embedded so it doesn't depend on a file next to the
+// binary -- this is a single portable executable (AppImage, no installer).
+#include "icon_data.h"
+
 // -- i18n -------------------------------------------------------------
 
 enum class Str {
@@ -358,6 +362,11 @@ struct App {
     Tab *bookmarks_tab = nullptr;
     Tab *extensions_tab = nullptr;
 
+    // Pre-warmed blank tab (WebView already constructed and realized, web
+    // process already spawned) waiting to be claimed by the next "+" click
+    // -- see prepare_spare_tab(). Not in `tabs`, has no chrome pill yet.
+    Tab *spare_tab = nullptr;
+
     GtkWidget *settings_scroller = nullptr;  // stable container; contents are fully rebuilt on any change
     GtkWidget *settings_status_label = nullptr;
 
@@ -572,6 +581,7 @@ static void apply_lightweight_settings_to_all_tabs() {
     for (Tab *t : app->tabs) {
         if (t->view) apply_lightweight_settings(t->view);
     }
+    if (app->spare_tab && app->spare_tab->view) apply_lightweight_settings(app->spare_tab->view);
     if (app->chrome_view) apply_lightweight_settings(app->chrome_view);
 }
 
@@ -655,14 +665,47 @@ struct PendingTabInit {
     bool switch_to;
 };
 
+static void prepare_spare_tab();
+
 static gboolean idle_finish_new_tab(gpointer data) {
     auto *pending = static_cast<PendingTabInit *>(data);
     if (Tab *tab = find_tab_by_id(pending->tab_id)) finish_new_tab(tab, pending->uri, pending->switch_to, nullptr);
     delete pending;
+    if (!app->spare_tab) prepare_spare_tab();
+    return G_SOURCE_REMOVE;
+}
+
+// Keeps one blank tab fully constructed and realized (WebView created, web
+// process already spawned by loading about:blank) sitting off-screen, so a
+// "+" click can claim it and switch instantly instead of paying the
+// construction/realize cost -- which is the actual slow part, see
+// finish_new_tab() -- on the click itself. Refilled after every claim.
+static void prepare_spare_tab() {
+    if (app->spare_tab) return;
+    Tab *tab = new Tab();
+    tab->id = app->next_tab_id++;
+    finish_new_tab(tab, "about:blank", false, nullptr);
+    app->spare_tab = tab;
+}
+
+static gboolean idle_prepare_spare_tab(gpointer) {
+    prepare_spare_tab();
     return G_SOURCE_REMOVE;
 }
 
 static Tab *new_tab(const std::string &uri, bool switch_to, WebKitWebView *related_view) {
+    if (!related_view && app->spare_tab) {
+        Tab *tab = app->spare_tab;
+        app->spare_tab = nullptr;
+        app->tabs.push_back(tab);
+        run_chrome_js("photonAddTab(" + std::to_string(tab->id) + "," +
+                      js_string_literal(tr(Str::NewTab, app->settings.language)) + ",null,\"\")");
+        webkit_web_view_load_uri(tab->view, uri.empty() ? home_uri().c_str() : uri.c_str());
+        if (switch_to) switch_to_tab(tab);
+        g_idle_add(idle_prepare_spare_tab, nullptr);
+        return tab;
+    }
+
     Tab *tab = new Tab();
     tab->id = app->next_tab_id++;
 
@@ -1362,6 +1405,7 @@ static void apply_adblock_to_all_tabs() {
     for (Tab *t : app->tabs) {
         if (t->view) apply_adblock_to_view(t->view);
     }
+    if (app->spare_tab && app->spare_tab->view) apply_adblock_to_view(app->spare_tab->view);
 }
 
 static void on_adblock_filter_ready(GObject *source, GAsyncResult *res, gpointer) {
@@ -1439,6 +1483,7 @@ static void apply_extensions_to_all_tabs() {
     for (Tab *t : app->tabs) {
         if (t->view) apply_extensions_to_view(t->view);
     }
+    if (app->spare_tab && app->spare_tab->view) apply_extensions_to_view(app->spare_tab->view);
 }
 
 static void on_extension_enabled_toggled(GtkToggleButton *btn, gpointer user_data) {
@@ -2184,7 +2229,7 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
                 text-overflow:ellipsis; cursor:default; }
 .suggest-item:hover, .suggest-item.active { background:rgba(128,128,128,0.25); }
 #bookmarks-wrap { position:relative; }
-#bookmarks-menu { display:none; position:absolute; right:0; bottom:38px; background:var(--tab-active); color:var(--fg);
+#bookmarks-menu { display:none; position:absolute; right:0; top:calc(100% + 4px); background:var(--tab-active); color:var(--fg);
                    border:1px solid var(--border); border-radius:8px; padding:6px; min-width:190px;
                    box-shadow:0 4px 16px rgba(0,0,0,0.35); z-index:10; }
 #bookmarks-menu.open { display:block; }
@@ -2472,6 +2517,20 @@ static void on_chrome_ready(WebKitWebView *view, WebKitLoadEvent event, gpointer
 }
 
 int main(int argc, char **argv) {
+    // KWin's native-Wayland path doesn't reliably honor
+    // gtk_window_set_decorated(FALSE) -- GTK3 only asks for *client-side*
+    // decorations (i.e. none, since we don't draw a headerbar either) via
+    // the xdg-decoration protocol when it's decided one way or the other,
+    // and on Wayland KWin has historically defaulted undecided/legacy GTK
+    // windows to its own server-side titlebar instead. XWayland's X11 path
+    // doesn't have that ambiguity: window managers there decorate purely
+    // off Motif hints, which gtk_window_set_decorated(FALSE) sets directly
+    // and KWin has always respected. So under Wayland, route through
+    // XWayland just for this app, unless the user already forced a backend.
+    if (!g_getenv("GDK_BACKEND")) {
+        const char *session = g_getenv("XDG_SESSION_TYPE");
+        if (session && g_strcmp0(session, "wayland") == 0) g_setenv("GDK_BACKEND", "x11", TRUE);
+    }
     gtk_init(&argc, &argv);
 
     app = new App();
@@ -2507,6 +2566,14 @@ int main(int argc, char **argv) {
     // dragging live in the HTML chrome itself, so tabs+toolbar get the full
     // top of the window instead of sharing it with an empty GtkHeaderBar.
     gtk_window_set_decorated(GTK_WINDOW(app->window), FALSE);
+    {
+        GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+        if (gdk_pixbuf_loader_write(loader, PHOTON_ICON_PNG, PHOTON_ICON_PNG_LEN, nullptr) &&
+            gdk_pixbuf_loader_close(loader, nullptr)) {
+            gtk_window_set_icon(GTK_WINDOW(app->window), gdk_pixbuf_loader_get_pixbuf(loader));
+        }
+        g_object_unref(loader);
+    }
     g_signal_connect(app->window, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
     g_signal_connect(app->window, "delete-event", G_CALLBACK(on_delete_event), nullptr);
 

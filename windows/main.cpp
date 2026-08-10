@@ -342,13 +342,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // -- entry point ------------------------------------------------------
 
+// Resource ID 101 matches app.rc -- keep them in sync.
+#define IDI_APPICON 101
+
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+  HICON appIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+
   WNDCLASSEXW mainClass = {sizeof(mainClass)};
   mainClass.lpfnWndProc = MainProc;
   mainClass.hInstance = hInstance;
   mainClass.lpszClassName = MAIN_CLASS;
   mainClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
   mainClass.hbrBackground = CreateSolidBrush(RGB(0x1a, 0x1b, 0x1e));
+  mainClass.hIcon = appIcon;
+  mainClass.hIconSm = appIcon;
   RegisterClassExW(&mainClass);
 
   WNDCLASSEXW childClass = {sizeof(childClass)};

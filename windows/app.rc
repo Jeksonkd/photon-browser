@@ -1,0 +1,2 @@
+// Resource ID 101 matches IDI_APPICON in main.cpp -- keep them in sync.
+101 ICON "icon.ico"

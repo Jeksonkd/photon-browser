@@ -38,8 +38,7 @@ jobs:
           Icon=photon-browser
           Categories=Network;WebBrowser;
           EOF
-          # Minimal 1x1 placeholder icon so appimagetool doesn't refuse to package.
-          printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x02\0\0\0\x90wS\xde\0\0\0\x0cIDATx\x9cc\xf8\xcf\xc0\0\0\x03\x01\x01\0\x18\xdd\x8d\xb0\0\0\0\0IEND\xaeB`\x82' > PhotonBrowser.AppDir/photon-browser.png
+          cp assets/logo.png PhotonBrowser.AppDir/photon-browser.png
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run PhotonBrowser.AppDir PhotonBrowser-x86_64.AppImage
@@ -69,9 +68,10 @@ jobs:
         shell: pwsh
         run: |
           $wv2 = "packages\Microsoft.Web.WebView2"
+          rc.exe /fo app.res app.rc
           cl.exe /EHsc /std:c++17 /DUNICODE /D_UNICODE /I "$wv2\build\native\include" main.cpp `
             /link /LIBPATH:"$wv2\build\native\x64" WebView2LoaderStatic.lib `
-            user32.lib gdi32.lib ole32.lib shell32.lib comctl32.lib `
+            user32.lib gdi32.lib ole32.lib shell32.lib comctl32.lib app.res `
             /OUT:PhotonBrowser.exe /SUBSYSTEM:WINDOWS
 
       - uses: actions/upload-artifact@v4

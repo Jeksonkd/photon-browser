@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="Photon Browser" width="120"></p>
+
 # Photon Browser
 
 A lightweight browser. On Linux it's built on GTK3 + WebKitGTK; on Windows,
