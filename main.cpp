@@ -574,19 +574,26 @@ static void run_chrome_js(const std::string &code) {
                                          nullptr);
 }
 
-// Hardware acceleration back off by default (neither ALWAYS nor WebKit's
-// adaptive ON_DEMAND made new-tab creation faster -- the real fix was
-// deferring WebView construction itself, see finish_new_tab()/new_tab()).
-// The "RAM saving mode" setting still exists and still forces NEVER, kept
-// for anyone who wants it explicit even though it's currently the default
-// either way.
+// Hardware acceleration used to be forced off unconditionally, including
+// when "RAM saving mode" was off -- that setting was never actually read
+// here. It was justified purely by new-tab-creation speed (neither ALWAYS
+// nor ON_DEMAND helped that metric), but the real fix for that turned out
+// to be pre-warming a spare tab (see prepare_spare_tab()), not this. Left
+// in place, forcing software-only rendering meant every page's scrolling,
+// sticky/fixed elements and animations were composited entirely on the
+// CPU -- laggy on anything non-trivial (e.g. Google search results). Now
+// only actually off when the user opts into RAM saving; ON_DEMAND
+// (WebKit's adaptive default) otherwise, so the GPU is used exactly when a
+// page needs it for smooth compositing.
 //
 // Page cache stays disabled: don't hold fully-rendered previous pages in
 // memory for instant back/forward (back/forward does a real reload instead).
 static void apply_lightweight_settings(WebKitWebView *view) {
     WebKitSettings *settings = webkit_web_view_get_settings(view);
     webkit_settings_set_enable_page_cache(settings, FALSE);
-    webkit_settings_set_hardware_acceleration_policy(settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+    webkit_settings_set_hardware_acceleration_policy(
+        settings, app->settings.ram_saving_mode ? WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER
+                                                  : WEBKIT_HARDWARE_ACCELERATION_POLICY_ON_DEMAND);
 }
 
 static void apply_lightweight_settings_to_all_tabs() {
