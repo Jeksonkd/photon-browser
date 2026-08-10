@@ -367,6 +367,13 @@ struct App {
     // -- see prepare_spare_tab(). Not in `tabs`, has no chrome pill yet.
     Tab *spare_tab = nullptr;
 
+    // The bookmarks "..." dropdown is HTML drawn inside the chrome WebView,
+    // which has a fixed native widget height -- content positioned past that
+    // height is outside the widget's allocation and never rendered at all,
+    // no matter what CSS says. update_chrome_height() grows the widget while
+    // the menu is open so it has native room to actually draw into.
+    bool bookmarks_menu_open = false;
+
     GtkWidget *settings_scroller = nullptr;  // stable container; contents are fully rebuilt on any change
     GtkWidget *settings_status_label = nullptr;
 
@@ -952,6 +959,12 @@ static void on_chrome_message(WebKitUserContentManager *, WebKitJavascriptResult
         open_bookmarks_tab();
     } else if (msg == "toggleBookmark") {
         toggle_bookmark_current();
+    } else if (msg == "bmMenuOpen") {
+        app->bookmarks_menu_open = true;
+        update_chrome_height();
+    } else if (msg == "bmMenuClose") {
+        app->bookmarks_menu_open = false;
+        update_chrome_height();
     } else if (starts_with("switchTab:")) {
         if (Tab *t = find_tab_by_id(atoi(msg.c_str() + 10))) switch_to_tab(t);
     } else if (starts_with("closeTab:")) {
@@ -1774,9 +1787,14 @@ static void push_chrome_tab_style() {
 // content, so it can't just grow/scroll) -- it must be kept in sync with the
 // CSS row heights (tabs row + toolbar row), or bigger buttons/tabs get
 // silently clipped at the bottom of the WebView's native allocation.
+// Room the bookmarks dropdown needs below the toolbar: its own 12px padding,
+// two ~32px buttons, and the 4px gap it's offset by -- see #bookmarks-menu.
+static const int BOOKMARKS_MENU_EXTRA_HEIGHT = 90;
+
 static void update_chrome_height() {
     if (!app->chrome_view) return;
     int height = app->settings.tab_height + app->settings.toolbar_size + 14;
+    if (app->bookmarks_menu_open) height += BOOKMARKS_MENU_EXTRA_HEIGHT;
     gtk_widget_set_size_request(GTK_WIDGET(app->chrome_view), -1, height);
 }
 
@@ -2347,17 +2365,25 @@ addressEl.addEventListener('keydown', function(e) {
 addressEl.addEventListener('blur', function() { setTimeout(closeSuggestions, 100); });
 
 var bmMenu = document.getElementById('bookmarks-menu');
+// The menu is drawn inside the chrome WebView, which has a fixed native
+// height -- native grows that widget while the menu is open so there's
+// actually room to draw into (see update_chrome_height() / bmMenuOpen).
+function setBmMenuOpen(v) {
+  if (bmMenu.classList.contains('open') === v) return;
+  bmMenu.classList.toggle('open', v);
+  send(v ? 'bmMenuOpen' : 'bmMenuClose');
+}
 document.getElementById('bookmarks').addEventListener('click', function(e) {
   e.stopPropagation();
-  bmMenu.classList.toggle('open');
+  setBmMenuOpen(!bmMenu.classList.contains('open'));
 });
-document.addEventListener('click', function() { bmMenu.classList.remove('open'); });
+document.addEventListener('click', function() { setBmMenuOpen(false); });
 document.getElementById('bm-toggle').addEventListener('click', function() {
-  bmMenu.classList.remove('open');
+  setBmMenuOpen(false);
   send('toggleBookmark');
 });
 document.getElementById('bm-manage').addEventListener('click', function() {
-  bmMenu.classList.remove('open');
+  setBmMenuOpen(false);
   send('openBookmarksTab');
 });
 
