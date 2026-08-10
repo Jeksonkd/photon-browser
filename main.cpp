@@ -34,8 +34,8 @@ enum class Str {
     Save, Cancel, Bookmarks, BookmarkThis, RemoveBookmark, ManageBookmarks,
     Appearance, Theme, ThemeLight, ThemeDark, ThemeCustom, CustomColor,
     OpenCookieEditor, Toolbar, Back, Forward, Reload, AddressBar, Size,
-    TextColor, TabShape, Plugins, AddPlugin, EditPlugin, MatchPattern, PluginType,
-    Enabled, ManagePlugins, BlockAds, TabSize, RamSavingMode
+    TextColor, TabShape, Extensions, AddExtension, EditExtension, MatchPattern, ExtensionType,
+    Enabled, ManageExtensions, BlockAds, TabSize, RamSavingMode
 };
 
 static const char *tr(Str key, const std::string &lang) {
@@ -83,13 +83,13 @@ static const char *tr(Str key, const std::string &lang) {
         {Str::Size, {"Button size", "Размер кнопок"}},
         {Str::TextColor, {"Text color", "Цвет текста"}},
         {Str::TabShape, {"Tab roundness", "Скругление вкладок"}},
-        {Str::Plugins, {"Plugins", "Плагины"}},
-        {Str::AddPlugin, {"Add plugin", "Добавить плагин"}},
-        {Str::EditPlugin, {"Edit plugin", "Изменить плагин"}},
+        {Str::Extensions, {"Extensions", "Расширения"}},
+        {Str::AddExtension, {"Add extension", "Добавить расширение"}},
+        {Str::EditExtension, {"Edit extension", "Изменить расширение"}},
         {Str::MatchPattern, {"Match pattern (empty = all sites)", "Шаблон адреса (пусто = все сайты)"}},
-        {Str::PluginType, {"Type", "Тип"}},
+        {Str::ExtensionType, {"Type", "Тип"}},
         {Str::Enabled, {"Enabled", "Включён"}},
-        {Str::ManagePlugins, {"Manage plugins", "Управление плагинами"}},
+        {Str::ManageExtensions, {"Manage extensions", "Управление расширениями"}},
         {Str::BlockAds, {"Block ads & trackers", "Блокировать рекламу и трекеры"}},
         {Str::RamSavingMode,
          {"RAM saving mode (locks hardware acceleration off)", "Режим экономии ОЗУ (аппаратное ускорение всегда выключено)"}},
@@ -125,9 +125,9 @@ struct Bookmark {
 
 static const std::vector<std::string> TOOLBAR_IDS = {"back", "forward", "reload", "address", "settings", "bookmarks"};
 
-// -- plugins (userscripts / userstyles) --------------------------------
+// -- extensions (userscripts / userstyles) --------------------------------
 
-struct Plugin {
+struct Extension {
     std::string name;
     std::string match;  // WebKit match pattern, e.g. "https://example.com/*"; empty = all sites
     std::string type;   // "js" | "css"
@@ -151,7 +151,7 @@ struct Settings {
     bool ram_saving_mode = false;  // locks hardware acceleration off for every page, not just on demand
     std::vector<std::string> toolbar_order = {"back", "forward", "reload", "address", "settings", "bookmarks"};
     std::vector<Bookmark> bookmarks;
-    std::vector<Plugin> plugins;
+    std::vector<Extension> extensions;
 };
 
 static std::string config_dir() { return std::string(g_get_user_config_dir()) + "/photon-browser"; }
@@ -243,11 +243,11 @@ static Settings load_settings() {
 
     if (loaded) {
         GError *err = nullptr;
-        gint pcount = g_key_file_get_integer(kf, "general", "plugin_count", &err);
+        gint pcount = g_key_file_get_integer(kf, "general", "extension_count", &err);
         g_clear_error(&err);
         for (int i = 0; i < pcount; i++) {
-            std::string group = "plugin:" + std::to_string(i);
-            Plugin p;
+            std::string group = "extension:" + std::to_string(i);
+            Extension p;
             gchar *v;
             v = g_key_file_get_string(kf, group.c_str(), "name", nullptr);
             p.name = v ? v : "";
@@ -264,7 +264,7 @@ static Settings load_settings() {
             gboolean en = g_key_file_get_boolean(kf, group.c_str(), "enabled", &err);
             p.enabled = err ? true : bool(en);
             g_clear_error(&err);
-            s.plugins.push_back(p);
+            s.extensions.push_back(p);
         }
     }
 
@@ -303,10 +303,10 @@ static void save_settings(const Settings &s) {
     g_key_file_set_boolean(kf, "general", "adblock_enabled", s.adblock_enabled);
     g_key_file_set_boolean(kf, "general", "ram_saving_mode", s.ram_saving_mode);
 
-    g_key_file_set_integer(kf, "general", "plugin_count", (int)s.plugins.size());
-    for (size_t i = 0; i < s.plugins.size(); ++i) {
-        std::string group = "plugin:" + std::to_string(i);
-        const auto &p = s.plugins[i];
+    g_key_file_set_integer(kf, "general", "extension_count", (int)s.extensions.size());
+    for (size_t i = 0; i < s.extensions.size(); ++i) {
+        std::string group = "extension:" + std::to_string(i);
+        const auto &p = s.extensions[i];
         g_key_file_set_string(kf, group.c_str(), "name", p.name.c_str());
         g_key_file_set_string(kf, group.c_str(), "match", p.match.c_str());
         g_key_file_set_string(kf, group.c_str(), "type", p.type.c_str());
@@ -356,7 +356,7 @@ struct App {
     Tab *settings_tab = nullptr;
     Tab *cookies_tab = nullptr;
     Tab *bookmarks_tab = nullptr;
-    Tab *plugins_tab = nullptr;
+    Tab *extensions_tab = nullptr;
 
     GtkWidget *settings_scroller = nullptr;  // stable container; contents are fully rebuilt on any change
     GtkWidget *settings_status_label = nullptr;
@@ -364,7 +364,7 @@ struct App {
     GtkWidget *cookie_listbox = nullptr;
     GtkWidget *cookie_status_label = nullptr;
     GtkWidget *bookmarks_listbox = nullptr;
-    GtkWidget *plugins_listbox = nullptr;
+    GtkWidget *extensions_listbox = nullptr;
 
     GtkCssProvider *theme_css = nullptr;
 
@@ -409,10 +409,10 @@ static void on_back(GtkButton *, gpointer);
 static void on_forward(GtkButton *, gpointer);
 static void on_reload(GtkButton *, gpointer);
 static void on_cookies_clicked(GtkButton *, gpointer);
-static void open_plugins_tab();
-static void refresh_plugins_ui();
-static void apply_plugins_to_view(WebKitWebView *view);
-static void apply_plugins_to_all_tabs();
+static void open_extensions_tab();
+static void refresh_extensions_ui();
+static void apply_extensions_to_view(WebKitWebView *view);
+static void apply_extensions_to_all_tabs();
 static void push_chrome_tab_style();
 static void apply_adblock_to_view(WebKitWebView *view);
 static void apply_adblock_to_all_tabs();
@@ -628,7 +628,7 @@ static void finish_new_tab(Tab *tab, const std::string &uri, bool switch_to, Web
                                            : webkit_web_view_new_with_context(app->web_context);
     tab->view = WEBKIT_WEB_VIEW(view_widget);
     apply_lightweight_settings(tab->view);
-    apply_plugins_to_view(tab->view);
+    apply_extensions_to_view(tab->view);
     apply_adblock_to_view(tab->view);
 
     tab->page = gtk_scrolled_window_new(nullptr, nullptr);
@@ -703,9 +703,9 @@ static void close_tab(Tab *tab) {
         app->bookmarks_tab = nullptr;
         app->bookmarks_listbox = nullptr;
     }
-    if (tab == app->plugins_tab) {
-        app->plugins_tab = nullptr;
-        app->plugins_listbox = nullptr;
+    if (tab == app->extensions_tab) {
+        app->extensions_tab = nullptr;
+        app->extensions_listbox = nullptr;
     }
 
     run_chrome_js("photonRemoveTab(" + std::to_string(tab->id) + ")");
@@ -1399,20 +1399,20 @@ static void on_ram_saving_toggled(GtkToggleButton *btn, gpointer) {
     apply_lightweight_settings_to_all_tabs();
 }
 
-// -- plugins (userscripts / userstyles) --------------------------------
+// -- extensions (userscripts / userstyles) --------------------------------
 //
 // WebKitGTK has no public API for loading real Chrome/Firefox-format browser
 // extensions (no extension-store hookup is possible), so this is a
 // Tampermonkey/Stylus-style manager instead: JS or CSS snippets injected
 // into pages via WebKitUserContentManager, optionally scoped to a URL match
 // pattern. Applied per-tab at creation and re-applied to all open tabs
-// whenever the plugin list changes.
+// whenever the extension list changes.
 
-static void apply_plugins_to_view(WebKitWebView *view) {
+static void apply_extensions_to_view(WebKitWebView *view) {
     WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(view);
     webkit_user_content_manager_remove_all_scripts(ucm);
     webkit_user_content_manager_remove_all_style_sheets(ucm);
-    for (const auto &p : app->settings.plugins) {
+    for (const auto &p : app->settings.extensions) {
         if (!p.enabled || p.code.empty()) continue;
         const gchar *allow_list[2] = {nullptr, nullptr};
         const gchar *const *allow = nullptr;
@@ -1435,31 +1435,31 @@ static void apply_plugins_to_view(WebKitWebView *view) {
     }
 }
 
-static void apply_plugins_to_all_tabs() {
+static void apply_extensions_to_all_tabs() {
     for (Tab *t : app->tabs) {
-        if (t->view) apply_plugins_to_view(t->view);
+        if (t->view) apply_extensions_to_view(t->view);
     }
 }
 
-static void on_plugin_enabled_toggled(GtkToggleButton *btn, gpointer user_data) {
+static void on_extension_enabled_toggled(GtkToggleButton *btn, gpointer user_data) {
     int idx = GPOINTER_TO_INT(user_data);
-    if (idx < 0 || idx >= int(app->settings.plugins.size())) return;
-    app->settings.plugins[idx].enabled = gtk_toggle_button_get_active(btn);
+    if (idx < 0 || idx >= int(app->settings.extensions.size())) return;
+    app->settings.extensions[idx].enabled = gtk_toggle_button_get_active(btn);
     save_settings(app->settings);
-    apply_plugins_to_all_tabs();
+    apply_extensions_to_all_tabs();
 }
 
-static void on_plugin_delete_clicked(GtkButton *, gpointer user_data) {
+static void on_extension_delete_clicked(GtkButton *, gpointer user_data) {
     int idx = GPOINTER_TO_INT(user_data);
-    if (idx < 0 || idx >= int(app->settings.plugins.size())) return;
-    app->settings.plugins.erase(app->settings.plugins.begin() + idx);
+    if (idx < 0 || idx >= int(app->settings.extensions.size())) return;
+    app->settings.extensions.erase(app->settings.extensions.begin() + idx);
     save_settings(app->settings);
-    apply_plugins_to_all_tabs();
-    refresh_plugins_ui();
+    apply_extensions_to_all_tabs();
+    refresh_extensions_ui();
 }
 
-struct PluginDialogCtx {
-    int index;  // -1 for a new plugin
+struct ExtensionDialogCtx {
+    int index;  // -1 for a new extension
     GtkWidget *name_entry;
     GtkWidget *match_entry;
     GtkWidget *type_combo;
@@ -1467,10 +1467,10 @@ struct PluginDialogCtx {
     GtkWidget *enabled_check;
 };
 
-static void on_plugin_dialog_response(GtkDialog *dialog, gint response, gpointer user_data) {
-    auto *ctx = static_cast<PluginDialogCtx *>(user_data);
+static void on_extension_dialog_response(GtkDialog *dialog, gint response, gpointer user_data) {
+    auto *ctx = static_cast<ExtensionDialogCtx *>(user_data);
     if (response == GTK_RESPONSE_OK) {
-        Plugin p;
+        Extension p;
         p.name = gtk_entry_get_text(GTK_ENTRY(ctx->name_entry));
         p.match = gtk_entry_get_text(GTK_ENTRY(ctx->match_entry));
         const gchar *type_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(ctx->type_combo));
@@ -1485,26 +1485,26 @@ static void on_plugin_dialog_response(GtkDialog *dialog, gint response, gpointer
         p.enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx->enabled_check));
 
         if (!p.name.empty()) {
-            if (ctx->index >= 0 && ctx->index < int(app->settings.plugins.size())) {
-                app->settings.plugins[ctx->index] = p;
+            if (ctx->index >= 0 && ctx->index < int(app->settings.extensions.size())) {
+                app->settings.extensions[ctx->index] = p;
             } else {
-                app->settings.plugins.push_back(p);
+                app->settings.extensions.push_back(p);
             }
             save_settings(app->settings);
-            apply_plugins_to_all_tabs();
-            refresh_plugins_ui();
+            apply_extensions_to_all_tabs();
+            refresh_extensions_ui();
         }
     }
     delete ctx;
     gtk_widget_destroy(GTK_WIDGET(dialog));
 }
 
-static void open_plugin_dialog(int index) {
+static void open_extension_dialog(int index) {
     const std::string &lang = app->settings.language;
-    bool editing = index >= 0 && index < int(app->settings.plugins.size());
+    bool editing = index >= 0 && index < int(app->settings.extensions.size());
 
     GtkWidget *dialog = gtk_dialog_new_with_buttons(
-        tr(editing ? Str::EditPlugin : Str::AddPlugin, lang), GTK_WINDOW(app->window), GTK_DIALOG_MODAL,
+        tr(editing ? Str::EditExtension : Str::AddExtension, lang), GTK_WINDOW(app->window), GTK_DIALOG_MODAL,
         tr(Str::Cancel, lang), GTK_RESPONSE_CANCEL, tr(Str::Save, lang), GTK_RESPONSE_OK, nullptr);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 480, 420);
 
@@ -1512,14 +1512,14 @@ static void open_plugin_dialog(int index) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(box), 12);
 
-    auto *ctx = new PluginDialogCtx();
+    auto *ctx = new ExtensionDialogCtx();
     ctx->index = index;
 
     GtkWidget *name_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(name_row), gtk_label_new(tr(Str::NameField, lang)), FALSE, FALSE, 0);
     ctx->name_entry = gtk_entry_new();
     gtk_widget_set_hexpand(ctx->name_entry, TRUE);
-    if (editing) gtk_entry_set_text(GTK_ENTRY(ctx->name_entry), app->settings.plugins[index].name.c_str());
+    if (editing) gtk_entry_set_text(GTK_ENTRY(ctx->name_entry), app->settings.extensions[index].name.c_str());
     gtk_box_pack_start(GTK_BOX(name_row), ctx->name_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(box), name_row, FALSE, FALSE, 0);
 
@@ -1528,19 +1528,19 @@ static void open_plugin_dialog(int index) {
     ctx->match_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(ctx->match_entry), "https://example.com/*");
     gtk_widget_set_hexpand(ctx->match_entry, TRUE);
-    if (editing) gtk_entry_set_text(GTK_ENTRY(ctx->match_entry), app->settings.plugins[index].match.c_str());
+    if (editing) gtk_entry_set_text(GTK_ENTRY(ctx->match_entry), app->settings.extensions[index].match.c_str());
     gtk_box_pack_start(GTK_BOX(match_row), ctx->match_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(box), match_row, FALSE, FALSE, 0);
 
     GtkWidget *type_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_pack_start(GTK_BOX(type_row), gtk_label_new(tr(Str::PluginType, lang)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(type_row), gtk_label_new(tr(Str::ExtensionType, lang)), FALSE, FALSE, 0);
     ctx->type_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ctx->type_combo), "js", "JavaScript");
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(ctx->type_combo), "css", "CSS");
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(ctx->type_combo), editing ? app->settings.plugins[index].type.c_str() : "js");
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(ctx->type_combo), editing ? app->settings.extensions[index].type.c_str() : "js");
     gtk_box_pack_start(GTK_BOX(type_row), ctx->type_combo, FALSE, FALSE, 0);
     ctx->enabled_check = gtk_check_button_new_with_label(tr(Str::Enabled, lang));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->enabled_check), editing ? app->settings.plugins[index].enabled : true);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->enabled_check), editing ? app->settings.extensions[index].enabled : true);
     gtk_box_pack_start(GTK_BOX(type_row), ctx->enabled_check, FALSE, FALSE, 12);
     gtk_box_pack_start(GTK_BOX(box), type_row, FALSE, FALSE, 0);
 
@@ -1550,31 +1550,31 @@ static void open_plugin_dialog(int index) {
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(ctx->code_view), TRUE);
     if (editing) {
         GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->code_view));
-        gtk_text_buffer_set_text(buf, app->settings.plugins[index].code.c_str(), -1);
+        gtk_text_buffer_set_text(buf, app->settings.extensions[index].code.c_str(), -1);
     }
     gtk_container_add(GTK_CONTAINER(code_scroller), ctx->code_view);
     gtk_box_pack_start(GTK_BOX(box), code_scroller, TRUE, TRUE, 0);
 
     gtk_container_add(GTK_CONTAINER(content), box);
     gtk_widget_show_all(dialog);
-    g_signal_connect(dialog, "response", G_CALLBACK(on_plugin_dialog_response), ctx);
+    g_signal_connect(dialog, "response", G_CALLBACK(on_extension_dialog_response), ctx);
 }
 
-static void on_plugin_edit_clicked(GtkButton *, gpointer user_data) { open_plugin_dialog(GPOINTER_TO_INT(user_data)); }
-static void on_add_plugin_clicked(GtkButton *, gpointer) { open_plugin_dialog(-1); }
+static void on_extension_edit_clicked(GtkButton *, gpointer user_data) { open_extension_dialog(GPOINTER_TO_INT(user_data)); }
+static void on_add_extension_clicked(GtkButton *, gpointer) { open_extension_dialog(-1); }
 
-static void refresh_plugins_ui() {
-    if (!app->plugins_listbox) return;
-    clear_container(app->plugins_listbox);
-    for (size_t i = 0; i < app->settings.plugins.size(); ++i) {
-        const auto &p = app->settings.plugins[i];
+static void refresh_extensions_ui() {
+    if (!app->extensions_listbox) return;
+    clear_container(app->extensions_listbox);
+    for (size_t i = 0; i < app->settings.extensions.size(); ++i) {
+        const auto &p = app->settings.extensions[i];
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
         gtk_container_set_border_width(GTK_CONTAINER(hbox), 6);
 
         GtkWidget *enabled_check = gtk_check_button_new();
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(enabled_check), p.enabled);
-        g_signal_connect(enabled_check, "toggled", G_CALLBACK(on_plugin_enabled_toggled), GINT_TO_POINTER(int(i)));
+        g_signal_connect(enabled_check, "toggled", G_CALLBACK(on_extension_enabled_toggled), GINT_TO_POINTER(int(i)));
 
         GtkWidget *name_lbl = gtk_label_new(p.name.c_str());
         gtk_label_set_width_chars(GTK_LABEL(name_lbl), 18);
@@ -1593,13 +1593,13 @@ static void refresh_plugins_ui() {
         gtk_button_set_relief(GTK_BUTTON(edit_btn), GTK_RELIEF_NONE);
         gtk_button_set_image(GTK_BUTTON(edit_btn),
                               gtk_image_new_from_icon_name("document-edit-symbolic", GTK_ICON_SIZE_MENU));
-        g_signal_connect(edit_btn, "clicked", G_CALLBACK(on_plugin_edit_clicked), GINT_TO_POINTER(int(i)));
+        g_signal_connect(edit_btn, "clicked", G_CALLBACK(on_extension_edit_clicked), GINT_TO_POINTER(int(i)));
 
         GtkWidget *delete_btn = gtk_button_new();
         gtk_button_set_relief(GTK_BUTTON(delete_btn), GTK_RELIEF_NONE);
         gtk_button_set_image(GTK_BUTTON(delete_btn),
                               gtk_image_new_from_icon_name("edit-delete-symbolic", GTK_ICON_SIZE_MENU));
-        g_signal_connect(delete_btn, "clicked", G_CALLBACK(on_plugin_delete_clicked), GINT_TO_POINTER(int(i)));
+        g_signal_connect(delete_btn, "clicked", G_CALLBACK(on_extension_delete_clicked), GINT_TO_POINTER(int(i)));
 
         gtk_box_pack_start(GTK_BOX(hbox), enabled_check, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(hbox), name_lbl, FALSE, FALSE, 0);
@@ -1608,39 +1608,39 @@ static void refresh_plugins_ui() {
         gtk_box_pack_start(GTK_BOX(hbox), edit_btn, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(hbox), delete_btn, FALSE, FALSE, 0);
         gtk_container_add(GTK_CONTAINER(row), hbox);
-        gtk_list_box_insert(GTK_LIST_BOX(app->plugins_listbox), row, -1);
+        gtk_list_box_insert(GTK_LIST_BOX(app->extensions_listbox), row, -1);
     }
-    gtk_widget_show_all(app->plugins_listbox);
+    gtk_widget_show_all(app->extensions_listbox);
 }
 
-static GtkWidget *build_plugins_page() {
+static GtkWidget *build_extensions_page() {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(box), 16);
     const std::string &lang = app->settings.language;
 
     GtkWidget *header_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *add_btn = gtk_button_new_with_label(tr(Str::AddPlugin, lang));
-    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_plugin_clicked), nullptr);
+    GtkWidget *add_btn = gtk_button_new_with_label(tr(Str::AddExtension, lang));
+    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_extension_clicked), nullptr);
     gtk_box_pack_start(GTK_BOX(header_row), add_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), header_row, FALSE, FALSE, 0);
 
     GtkWidget *scroller = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_widget_set_vexpand(scroller, TRUE);
-    app->plugins_listbox = gtk_list_box_new();
-    gtk_container_add(GTK_CONTAINER(scroller), app->plugins_listbox);
+    app->extensions_listbox = gtk_list_box_new();
+    gtk_container_add(GTK_CONTAINER(scroller), app->extensions_listbox);
     gtk_box_pack_start(GTK_BOX(box), scroller, TRUE, TRUE, 0);
     return box;
 }
 
-static void open_plugins_tab() {
-    if (app->plugins_tab) {
-        switch_to_tab(app->plugins_tab);
+static void open_extensions_tab() {
+    if (app->extensions_tab) {
+        switch_to_tab(app->extensions_tab);
         return;
     }
     Tab *tab = new Tab();
     tab->id = app->next_tab_id++;
-    tab->internal_title = Str::Plugins;
-    tab->page = build_plugins_page();
+    tab->internal_title = Str::Extensions;
+    tab->page = build_extensions_page();
     gtk_widget_show_all(tab->page);
 
     char name[24];
@@ -1648,14 +1648,14 @@ static void open_plugins_tab() {
     gtk_stack_add_named(GTK_STACK(app->content_stack), tab->page, name);
 
     app->tabs.push_back(tab);
-    app->plugins_tab = tab;
+    app->extensions_tab = tab;
     run_chrome_js("photonAddTab(" + std::to_string(tab->id) + "," +
-                  js_string_literal(tr(Str::Plugins, app->settings.language)) + ",null,\"\\u26a1\")");
-    refresh_plugins_ui();
+                  js_string_literal(tr(Str::Extensions, app->settings.language)) + ",null,\"\\u26a1\")");
+    refresh_extensions_ui();
     switch_to_tab(tab);
 }
 
-static void on_plugins_clicked(GtkButton *, gpointer) { open_plugins_tab(); }
+static void on_extensions_clicked(GtkButton *, gpointer) { open_extensions_tab(); }
 
 // -- appearance -----------------------------------------------------------
 
@@ -1667,7 +1667,7 @@ static void apply_theme() {
 
 // Styles the native GTK chrome that remains (window background, settings cards).
 // Explicitly colors every native GTK widget type used in Settings/Cookies/
-// Bookmarks/Plugins, rather than only setting window/headerbar background
+// Bookmarks/Extensions, rather than only setting window/headerbar background
 // and relying on gtk-application-prefer-dark-theme to get matching text
 // colors from the system theme. That only worked by coincidence when the
 // system theme happened to already be dark -- Light mode exposed it: a
@@ -1955,12 +1955,12 @@ static void refresh_settings_content() {
     g_signal_connect(cookies_btn, "clicked", G_CALLBACK(on_cookies_clicked), nullptr);
     gtk_box_pack_start(GTK_BOX(cookies), cookies_btn, FALSE, FALSE, 0);
 
-    // Plugins
-    GtkWidget *plugins = begin_settings_card(box, tr(Str::Plugins, lang));
-    GtkWidget *plugins_btn = gtk_button_new_with_label(tr(Str::ManagePlugins, lang));
-    gtk_widget_set_halign(plugins_btn, GTK_ALIGN_START);
-    g_signal_connect(plugins_btn, "clicked", G_CALLBACK(on_plugins_clicked), nullptr);
-    gtk_box_pack_start(GTK_BOX(plugins), plugins_btn, FALSE, FALSE, 0);
+    // Extensions
+    GtkWidget *extensions = begin_settings_card(box, tr(Str::Extensions, lang));
+    GtkWidget *extensions_btn = gtk_button_new_with_label(tr(Str::ManageExtensions, lang));
+    gtk_widget_set_halign(extensions_btn, GTK_ALIGN_START);
+    g_signal_connect(extensions_btn, "clicked", G_CALLBACK(on_extensions_clicked), nullptr);
+    gtk_box_pack_start(GTK_BOX(extensions), extensions_btn, FALSE, FALSE, 0);
 
     // Search
     GtkWidget *search = begin_settings_card(box, tr(Str::Search, lang));
@@ -2114,10 +2114,10 @@ static void refresh_language_ui() {
         run_chrome_js("photonUpdateTab(" + std::to_string(app->bookmarks_tab->id) + "," +
                       js_string_literal(tr(Str::Bookmarks, lang)) + ",null)");
     }
-    if (app->plugins_tab) {
-        run_chrome_js("photonUpdateTab(" + std::to_string(app->plugins_tab->id) + "," +
-                      js_string_literal(tr(Str::Plugins, lang)) + ",null)");
-        refresh_plugins_ui();
+    if (app->extensions_tab) {
+        run_chrome_js("photonUpdateTab(" + std::to_string(app->extensions_tab->id) + "," +
+                      js_string_literal(tr(Str::Extensions, lang)) + ",null)");
+        refresh_extensions_ui();
     }
     if (app->settings_tab) {
         run_chrome_js("photonUpdateTab(" + std::to_string(app->settings_tab->id) + "," +

@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libjson-glib-dev libsoup-3.0-dev pkg-config build-essential
+
+      - name: Build
+        run: make
+
+      - name: Package AppImage
+        run: |
+          mkdir -p PhotonBrowser.AppDir/usr/bin
+          cp photon-browser PhotonBrowser.AppDir/usr/bin/
+          cat > PhotonBrowser.AppDir/AppRun << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/photon-browser" "$@"
+          EOF
+          chmod +x PhotonBrowser.AppDir/AppRun
+          cat > PhotonBrowser.AppDir/photon-browser.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Photon Browser
+          Exec=photon-browser
+          Icon=photon-browser
+          Categories=Network;WebBrowser;
+          EOF
+          # Minimal 1x1 placeholder icon so appimagetool doesn't refuse to package.
+          printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x02\0\0\0\x90wS\xde\0\0\0\x0cIDATx\x9cc\xf8\xcf\xc0\0\0\x03\x01\x01\0\x18\xdd\x8d\xb0\0\0\0\0IEND\xaeB`\x82' > PhotonBrowser.AppDir/photon-browser.png
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run PhotonBrowser.AppDir PhotonBrowser-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            photon-browser
+            PhotonBrowser-x86_64.AppImage
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Restore WebView2 SDK
+        shell: pwsh
+        run: nuget install Microsoft.Web.WebView2 -Version 1.0.2739.15 -OutputDirectory packages -ExcludeVersion
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $wv2 = "packages\Microsoft.Web.WebView2"
+          cl.exe /EHsc /std:c++17 /DUNICODE /D_UNICODE /I "$wv2\build\native\include" main.cpp `
+            /link /LIBPATH:"$wv2\build\native\x64" WebView2LoaderStatic.lib `
+            user32.lib gdi32.lib ole32.lib shell32.lib comctl32.lib `
+            /OUT:PhotonBrowser.exe /SUBSYSTEM:WINDOWS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: windows/PhotonBrowser.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            linux-artifacts/photon-browser
+            linux-artifacts/PhotonBrowser-x86_64.AppImage
+            windows-artifacts/PhotonBrowser.exe
