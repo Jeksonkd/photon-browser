@@ -39,7 +39,7 @@ enum class Str {
     Appearance, Theme, ThemeLight, ThemeDark, ThemeCustom, CustomColor,
     OpenCookieEditor, Toolbar, Back, Forward, Reload, AddressBar, Size,
     TextColor, TabShape, Extensions, AddExtension, EditExtension, MatchPattern, ExtensionType,
-    Enabled, ManageExtensions, BlockAds, TabSize, RamSavingMode
+    Enabled, ManageExtensions, BlockAds, TabSize, RamSavingMode, ShowBookmarksBar
 };
 
 static const char *tr(Str key, const std::string &lang) {
@@ -98,6 +98,7 @@ static const char *tr(Str key, const std::string &lang) {
         {Str::RamSavingMode,
          {"RAM saving mode (locks hardware acceleration off)", "Режим экономии ОЗУ (аппаратное ускорение всегда выключено)"}},
         {Str::TabSize, {"Tab size", "Размер вкладок"}},
+        {Str::ShowBookmarksBar, {"Show bookmarks bar", "Показывать панель закладок"}},
     };
     int idx = (lang == "ru") ? 1 : 0;
     return table.at(key)[idx];
@@ -153,6 +154,7 @@ struct Settings {
     int toolbar_size = 28;       // px, applied to toolbar buttons and the address bar
     bool adblock_enabled = true;
     bool ram_saving_mode = false;  // locks hardware acceleration off for every page, not just on demand
+    bool show_bookmarks_bar = true;  // bar only actually shows when this is on AND bookmarks isn't empty
     std::vector<std::string> toolbar_order = {"back", "forward", "reload", "address", "settings", "bookmarks"};
     std::vector<Bookmark> bookmarks;
     std::vector<Extension> extensions;
@@ -222,6 +224,10 @@ static Settings load_settings() {
 
         gboolean ram_saving = g_key_file_get_boolean(kf, "general", "ram_saving_mode", &err);
         if (!err) s.ram_saving_mode = ram_saving;
+        g_clear_error(&err);
+
+        gboolean show_bm_bar = g_key_file_get_boolean(kf, "general", "show_bookmarks_bar", &err);
+        if (!err) s.show_bookmarks_bar = show_bm_bar;
         g_clear_error(&err);
     }
 
@@ -306,6 +312,7 @@ static void save_settings(const Settings &s) {
     g_key_file_set_integer(kf, "general", "tab_height", s.tab_height);
     g_key_file_set_boolean(kf, "general", "adblock_enabled", s.adblock_enabled);
     g_key_file_set_boolean(kf, "general", "ram_saving_mode", s.ram_saving_mode);
+    g_key_file_set_boolean(kf, "general", "show_bookmarks_bar", s.show_bookmarks_bar);
 
     g_key_file_set_integer(kf, "general", "extension_count", (int)s.extensions.size());
     for (size_t i = 0; i < s.extensions.size(); ++i) {
@@ -438,6 +445,7 @@ static void push_chrome_tab_style();
 static void apply_adblock_to_view(WebKitWebView *view);
 static void apply_adblock_to_all_tabs();
 static void update_chrome_height();
+static void push_bookmarks_bar();
 static void fetch_suggestions(const std::string &query);
 
 // -- generic helpers --------------------------------------------------------------
@@ -1075,6 +1083,7 @@ static void toggle_bookmark_current() {
     }
     save_settings(app->settings);
     refresh_bookmarks_ui();
+    push_bookmarks_bar();
 }
 
 static void on_bookmarks_popup_toggle_clicked(GtkButton *, gpointer) {
@@ -1139,6 +1148,7 @@ static void on_bookmark_delete_clicked(GtkButton *, gpointer user_data) {
     bms.erase(std::remove_if(bms.begin(), bms.end(), [&](const Bookmark &b) { return b.url == url; }), bms.end());
     save_settings(app->settings);
     refresh_bookmarks_ui();
+    push_bookmarks_bar();
 }
 
 static void refresh_bookmarks_ui() {
@@ -1508,6 +1518,12 @@ static void on_ram_saving_toggled(GtkToggleButton *btn, gpointer) {
     apply_lightweight_settings_to_all_tabs();
 }
 
+static void on_show_bookmarks_bar_toggled(GtkToggleButton *btn, gpointer) {
+    app->settings.show_bookmarks_bar = gtk_toggle_button_get_active(btn);
+    save_settings(app->settings);
+    push_bookmarks_bar();
+}
+
 // -- extensions (userscripts / userstyles) --------------------------------
 //
 // WebKitGTK has no public API for loading real Chrome/Firefox-format browser
@@ -1839,18 +1855,40 @@ static void push_chrome_tab_style() {
                   std::to_string(app->settings.tab_height) + ")");
 }
 
+// Bookmarks bar row height, added into the chrome's total when it's showing.
+static const int BOOKMARKS_BAR_HEIGHT = 30;
+
+// The bar only actually shows when the setting is on AND there's at least
+// one bookmark -- an empty bar is just wasted space, and always taking up
+// that space even before you have any bookmarks would be a bigger, more
+// surprising visual change than what was asked for.
+static bool bookmarks_bar_visible() { return app->settings.show_bookmarks_bar && !app->settings.bookmarks.empty(); }
+
 // The chrome is a real GTK widget with a fixed pixel height (it's not the page
 // content, so it can't just grow/scroll) -- it must be kept in sync with the
-// CSS row heights (tabs row + toolbar row), or bigger buttons/tabs get
-// silently clipped at the bottom of the WebView's native allocation. The
-// bookmarks popup floats separately via GtkOverlay (see App::bookmarks_popup)
-// but still needs to be pinned just below the toolbar, so its top margin is
-// kept in sync here too.
+// CSS row heights (tabs row + toolbar row + bookmarks bar), or bigger
+// buttons/tabs get silently clipped at the bottom of the WebView's native
+// allocation. The bookmarks popup floats separately via GtkOverlay (see
+// App::bookmarks_popup) but still needs to be pinned just below everything
+// else, so its top margin is kept in sync here too.
 static void update_chrome_height() {
     if (!app->chrome_view) return;
     int height = app->settings.tab_height + app->settings.toolbar_size + 14;
+    if (bookmarks_bar_visible()) height += BOOKMARKS_BAR_HEIGHT;
     gtk_widget_set_size_request(GTK_WIDGET(app->chrome_view), -1, height);
     if (app->bookmarks_popup) gtk_widget_set_margin_top(app->bookmarks_popup, height);
+}
+
+static void push_bookmarks_bar() {
+    std::string items = "[";
+    for (size_t i = 0; i < app->settings.bookmarks.size(); ++i) {
+        if (i) items += ",";
+        const Bookmark &b = app->settings.bookmarks[i];
+        items += "{\"title\":" + js_string_literal(b.title) + ",\"url\":" + js_string_literal(b.url) + "}";
+    }
+    items += "]";
+    run_chrome_js("photonSetBookmarksBar(" + items + "," + (bookmarks_bar_visible() ? "true" : "false") + ")");
+    update_chrome_height();
 }
 
 static Str toolbar_item_label(const std::string &id) {
@@ -2065,6 +2103,13 @@ static void refresh_settings_content() {
     gtk_widget_set_halign(cookies_btn, GTK_ALIGN_START);
     g_signal_connect(cookies_btn, "clicked", G_CALLBACK(on_cookies_clicked), nullptr);
     gtk_box_pack_start(GTK_BOX(cookies), cookies_btn, FALSE, FALSE, 0);
+
+    // Bookmarks
+    GtkWidget *bookmarks_card = begin_settings_card(box, tr(Str::Bookmarks, lang));
+    GtkWidget *bm_bar_check = gtk_check_button_new_with_label(tr(Str::ShowBookmarksBar, lang));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bm_bar_check), app->settings.show_bookmarks_bar);
+    g_signal_connect(bm_bar_check, "toggled", G_CALLBACK(on_show_bookmarks_bar_toggled), nullptr);
+    gtk_box_pack_start(GTK_BOX(bookmarks_card), bm_bar_check, FALSE, FALSE, 0);
 
     // Extensions
     GtkWidget *extensions = begin_settings_card(box, tr(Str::Extensions, lang));
@@ -2296,6 +2341,12 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
                 text-overflow:ellipsis; cursor:default; }
 .suggest-item:hover, .suggest-item.active { background:rgba(128,128,128,0.25); }
 #bookmarks-wrap { position:relative; }
+#bookmarks-bar { display:none; align-items:center; gap:4px; height:30px; padding:0 8px; overflow-x:auto;
+                  background:var(--bg2); border-top:1px solid var(--border); white-space:nowrap; }
+#bookmarks-bar.visible { display:flex; }
+.bm-bar-item { flex:0 0 auto; padding:5px 10px; border-radius:6px; color:var(--fg); font-size:12px;
+                white-space:nowrap; cursor:default; }
+.bm-bar-item:hover { background:rgba(128,128,128,0.2); }
 </style></head>
 <body class="theme-dark">
 <div id="tabs"></div>
@@ -2323,6 +2374,7 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
     <div id="win-close" class="winbtn winbtn-close" title="Close">&#10005;</div>
   </div>
 </div>
+<div id="bookmarks-bar"></div>
 <script>
 function send(msg) { window.webkit.messageHandlers.photon.postMessage(msg); }
 
@@ -2494,6 +2546,19 @@ function photonActivateTab(id, address) {
   photonSetActiveTab(id);
   photonSetAddress(address);
 }
+function photonSetBookmarksBar(items, visible) {
+  var bar = document.getElementById('bookmarks-bar');
+  bar.classList.toggle('visible', visible);
+  bar.innerHTML = '';
+  items.forEach(function(it) {
+    var el = document.createElement('div');
+    el.className = 'bm-bar-item';
+    el.textContent = it.title;
+    el.title = it.url;
+    el.addEventListener('click', function() { send('navigate:' + encodeURIComponent(it.url)); });
+    bar.appendChild(el);
+  });
+}
 var CUSTOM_VARS = ['--bg', '--bg2', '--tab-bg', '--tab-active', '--fg', '--fg-dim'];
 function photonSetTheme(theme, bgColor, fgColor) {
   document.body.className = 'theme-' + theme;
@@ -2545,6 +2610,7 @@ static void on_chrome_ready(WebKitWebView *view, WebKitLoadEvent event, gpointer
     push_chrome_theme();
     push_chrome_toolbar();
     push_chrome_tab_style();
+    push_bookmarks_bar();
 
     // The very first tab must be created here, not in main(): main() calls
     // this before gtk_main() has pumped a single event, so the chrome's own
