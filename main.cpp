@@ -367,12 +367,16 @@ struct App {
     // -- see prepare_spare_tab(). Not in `tabs`, has no chrome pill yet.
     Tab *spare_tab = nullptr;
 
-    // The bookmarks "..." dropdown is HTML drawn inside the chrome WebView,
-    // which has a fixed native widget height -- content positioned past that
-    // height is outside the widget's allocation and never rendered at all,
-    // no matter what CSS says. update_chrome_height() grows the widget while
-    // the menu is open so it has native room to actually draw into.
-    bool bookmarks_menu_open = false;
+    // The bookmarks "..." dropdown is a real native GTK widget floated over
+    // the page via GtkOverlay, not HTML drawn inside the chrome WebView --
+    // that WebView has a fixed native widget height, so HTML positioned past
+    // it is outside the widget's allocation and simply never rendered, no
+    // matter what CSS says. A native overlay widget has no such bound: it
+    // floats on top of the page content without displacing anything.
+    GtkWidget *bookmarks_popup = nullptr;
+    GtkWidget *bookmarks_toggle_btn = nullptr;
+    GtkWidget *bookmarks_manage_btn = nullptr;
+    bool bookmarks_popup_open = false;
 
     GtkWidget *settings_scroller = nullptr;  // stable container; contents are fully rebuilt on any change
     GtkWidget *settings_status_label = nullptr;
@@ -403,7 +407,6 @@ static Tab *current_tab();
 static void switch_to_tab(Tab *tab);
 static void update_window_title(Tab *tab);
 static void set_address_text(const char *uri);
-static void push_bookmark_state();
 static void open_settings_tab();
 static void open_cookie_editor_tab();
 static void open_bookmarks_tab();
@@ -416,10 +419,12 @@ static void open_cookie_dialog(SoupCookie *original);
 static void apply_theme();
 static void apply_appearance_css();
 static void push_chrome_theme();
-static void push_chrome_strings();
 static void push_chrome_toolbar();
 static void toggle_bookmark_current();
 static bool is_bookmarked(const std::string &url);
+static void open_bookmarks_popup();
+static void close_bookmarks_popup();
+static void toggle_bookmarks_popup();
 static void run_chrome_js(const std::string &code);
 static void on_back(GtkButton *, gpointer);
 static void on_forward(GtkButton *, gpointer);
@@ -604,10 +609,7 @@ static void on_title_changed(WebKitWebView *view, GParamSpec *, gpointer user_da
 
 static void on_uri_changed(WebKitWebView *view, GParamSpec *, gpointer user_data) {
     Tab *tab = static_cast<Tab *>(user_data);
-    if (app->current == tab) {
-        set_address_text(webkit_web_view_get_uri(view));
-        push_bookmark_state();
-    }
+    if (app->current == tab) set_address_text(webkit_web_view_get_uri(view));
 }
 
 static void on_favicon_changed(WebKitWebView *view, GParamSpec *, gpointer user_data) {
@@ -623,10 +625,7 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
     Tab *tab = static_cast<Tab *>(user_data);
     if (app->current != tab) return;
     set_loading(event != WEBKIT_LOAD_FINISHED);
-    if (event == WEBKIT_LOAD_COMMITTED) {
-        set_address_text(webkit_web_view_get_uri(view));
-        push_bookmark_state();
-    }
+    if (event == WEBKIT_LOAD_COMMITTED) set_address_text(webkit_web_view_get_uri(view));
 }
 
 static WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *, gpointer) {
@@ -790,17 +789,14 @@ static void switch_to_tab(Tab *tab) {
     // deferred finish_new_tab(); finish_new_tab() will call switch_to_tab()
     // itself once that's done if switch_to was requested.
     if (!tab || !tab->page) return;
+    close_bookmarks_popup();
     app->current = tab;
     gtk_stack_set_visible_child(GTK_STACK(app->content_stack), tab->page);
     update_window_title(tab);
 
-    // One combined JS call instead of three separate ones: each evaluate_javascript()
-    // is a round-trip to the chrome's WebProcess, and those add up.
     const gchar *uri = tab->view ? webkit_web_view_get_uri(tab->view) : nullptr;
     std::string address = uri ? uri : "";
-    bool marked = uri && is_bookmarked(address);
-    run_chrome_js("photonActivateTab(" + std::to_string(tab->id) + "," + js_string_literal(address) + "," +
-                  (marked ? "true" : "false") + ")");
+    run_chrome_js("photonActivateTab(" + std::to_string(tab->id) + "," + js_string_literal(address) + ")");
 }
 
 static void update_window_title(Tab *tab) {
@@ -955,16 +951,10 @@ static void on_chrome_message(WebKitUserContentManager *, WebKitJavascriptResult
         new_tab("", true, nullptr);
     } else if (msg == "openSettings") {
         open_settings_tab();
-    } else if (msg == "openBookmarksTab") {
-        open_bookmarks_tab();
-    } else if (msg == "toggleBookmark") {
-        toggle_bookmark_current();
-    } else if (msg == "bmMenuOpen") {
-        app->bookmarks_menu_open = true;
-        update_chrome_height();
+    } else if (msg == "bmMenuToggle") {
+        toggle_bookmarks_popup();
     } else if (msg == "bmMenuClose") {
-        app->bookmarks_menu_open = false;
-        update_chrome_height();
+        close_bookmarks_popup();
     } else if (starts_with("switchTab:")) {
         if (Tab *t = find_tab_by_id(atoi(msg.c_str() + 10))) switch_to_tab(t);
     } else if (starts_with("closeTab:")) {
@@ -1033,14 +1023,30 @@ static bool is_bookmarked(const std::string &url) {
     return false;
 }
 
-static void push_bookmark_state() {
+// Floats over the page via GtkOverlay -- see the App::bookmarks_popup
+// comment. Its label is computed fresh each time it opens rather than kept
+// continuously in sync, since nothing needs to observe it while it's closed.
+static void open_bookmarks_popup() {
     Tab *tab = app->current;
     bool marked = false;
     if (tab && tab->view) {
         const gchar *uri = webkit_web_view_get_uri(tab->view);
         if (uri) marked = is_bookmarked(uri);
     }
-    run_chrome_js(std::string("photonSetBookmarked(") + (marked ? "true" : "false") + ")");
+    gtk_button_set_label(GTK_BUTTON(app->bookmarks_toggle_btn),
+                          tr(marked ? Str::RemoveBookmark : Str::BookmarkThis, app->settings.language));
+    app->bookmarks_popup_open = true;
+    gtk_widget_show(app->bookmarks_popup);
+}
+
+static void close_bookmarks_popup() {
+    if (!app->bookmarks_popup || !app->bookmarks_popup_open) return;
+    app->bookmarks_popup_open = false;
+    gtk_widget_hide(app->bookmarks_popup);
+}
+
+static void toggle_bookmarks_popup() {
+    if (app->bookmarks_popup_open) close_bookmarks_popup(); else open_bookmarks_popup();
 }
 
 static void toggle_bookmark_current() {
@@ -1062,7 +1068,47 @@ static void toggle_bookmark_current() {
     }
     save_settings(app->settings);
     refresh_bookmarks_ui();
-    push_bookmark_state();
+}
+
+static void on_bookmarks_popup_toggle_clicked(GtkButton *, gpointer) {
+    close_bookmarks_popup();
+    toggle_bookmark_current();
+}
+
+static void on_bookmarks_popup_manage_clicked(GtkButton *, gpointer) {
+    close_bookmarks_popup();
+    open_bookmarks_tab();
+}
+
+// Left-align a GtkButton's label -- gtk_button_set_alignment() was removed
+// in GTK 3.20; the label's own xalign is the replacement.
+static void left_align_button_label(GtkWidget *button) {
+    gtk_label_set_xalign(GTK_LABEL(gtk_bin_get_child(GTK_BIN(button))), 0.0f);
+}
+
+static GtkWidget *build_bookmarks_popup() {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(box), "bookmarks-popup");
+    gtk_widget_set_size_request(box, 190, -1);
+    gtk_widget_set_margin_end(box, 6);
+
+    app->bookmarks_toggle_btn = gtk_button_new_with_label(tr(Str::BookmarkThis, app->settings.language));
+    left_align_button_label(app->bookmarks_toggle_btn);
+    g_signal_connect(app->bookmarks_toggle_btn, "clicked", G_CALLBACK(on_bookmarks_popup_toggle_clicked), nullptr);
+    gtk_box_pack_start(GTK_BOX(box), app->bookmarks_toggle_btn, FALSE, FALSE, 0);
+
+    app->bookmarks_manage_btn = gtk_button_new_with_label(tr(Str::ManageBookmarks, app->settings.language));
+    left_align_button_label(app->bookmarks_manage_btn);
+    g_signal_connect(app->bookmarks_manage_btn, "clicked", G_CALLBACK(on_bookmarks_popup_manage_clicked), nullptr);
+    gtk_box_pack_start(GTK_BOX(box), app->bookmarks_manage_btn, FALSE, FALSE, 0);
+
+    // Mark children visible now so a plain gtk_widget_show(box) later (no
+    // recursion) reveals them too, but exclude the box itself from the
+    // window's gtk_widget_show_all() -- it must stay hidden until toggled.
+    gtk_widget_show_all(box);
+    gtk_widget_set_no_show_all(box, TRUE);
+    gtk_widget_hide(box);
+    return box;
 }
 
 static void on_bookmark_favicon_ready(GObject *source, GAsyncResult *res, gpointer user_data) {
@@ -1086,7 +1132,6 @@ static void on_bookmark_delete_clicked(GtkButton *, gpointer user_data) {
     bms.erase(std::remove_if(bms.begin(), bms.end(), [&](const Bookmark &b) { return b.url == url; }), bms.end());
     save_settings(app->settings);
     refresh_bookmarks_ui();
-    push_bookmark_state();
 }
 
 static void refresh_bookmarks_ui() {
@@ -1763,7 +1808,11 @@ static void apply_appearance_css() {
         "entry, spinbutton entry, textview text { background-color: " + entry_bg + "; color: " + fg + "; } "
         "textview { background-color: " + entry_bg + "; } "
         ".settings-card { background-color: " + card_bg + "; border: 1px solid " + border + "; "
-        "border-radius: 10px; padding: 14px; } ";
+        "border-radius: 10px; padding: 14px; } "
+        ".bookmarks-popup { background-color: " + card_bg + "; border: 1px solid " + border + "; "
+        "border-radius: 8px; padding: 6px; } "
+        ".bookmarks-popup button { background: none; border: none; padding: 8px 10px; } "
+        ".bookmarks-popup button:hover { background-color: alpha(" + fg + ", 0.12); } ";
 
     if (!app->theme_css) {
         app->theme_css = gtk_css_provider_new();
@@ -1786,23 +1835,15 @@ static void push_chrome_tab_style() {
 // The chrome is a real GTK widget with a fixed pixel height (it's not the page
 // content, so it can't just grow/scroll) -- it must be kept in sync with the
 // CSS row heights (tabs row + toolbar row), or bigger buttons/tabs get
-// silently clipped at the bottom of the WebView's native allocation.
-// Room the bookmarks dropdown needs below the toolbar: its own 12px padding,
-// two ~32px buttons, and the 4px gap it's offset by -- see #bookmarks-menu.
-static const int BOOKMARKS_MENU_EXTRA_HEIGHT = 90;
-
+// silently clipped at the bottom of the WebView's native allocation. The
+// bookmarks popup floats separately via GtkOverlay (see App::bookmarks_popup)
+// but still needs to be pinned just below the toolbar, so its top margin is
+// kept in sync here too.
 static void update_chrome_height() {
     if (!app->chrome_view) return;
     int height = app->settings.tab_height + app->settings.toolbar_size + 14;
-    if (app->bookmarks_menu_open) height += BOOKMARKS_MENU_EXTRA_HEIGHT;
     gtk_widget_set_size_request(GTK_WIDGET(app->chrome_view), -1, height);
-}
-
-static void push_chrome_strings() {
-    const std::string &lang = app->settings.language;
-    run_chrome_js("photonSetStrings(" + js_string_literal(tr(Str::BookmarkThis, lang)) + "," +
-                  js_string_literal(tr(Str::RemoveBookmark, lang)) + "," +
-                  js_string_literal(tr(Str::ManageBookmarks, lang)) + ")");
+    if (app->bookmarks_popup) gtk_widget_set_margin_top(app->bookmarks_popup, height);
 }
 
 static Str toolbar_item_label(const std::string &id) {
@@ -2186,7 +2227,8 @@ static void refresh_language_ui() {
         run_chrome_js("photonUpdateTab(" + std::to_string(app->settings_tab->id) + "," +
                       js_string_literal(tr(Str::Settings, lang)) + ",null)");
     }
-    push_chrome_strings();
+    if (app->bookmarks_manage_btn) gtk_button_set_label(GTK_BUTTON(app->bookmarks_manage_btn), tr(Str::ManageBookmarks, lang));
+    if (app->bookmarks_toggle_btn && app->bookmarks_popup_open) open_bookmarks_popup();  // refreshes its label too
     if (Tab *cur = current_tab()) update_window_title(cur);
 }
 
@@ -2247,13 +2289,6 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
                 text-overflow:ellipsis; cursor:default; }
 .suggest-item:hover, .suggest-item.active { background:rgba(128,128,128,0.25); }
 #bookmarks-wrap { position:relative; }
-#bookmarks-menu { display:none; position:absolute; right:0; top:calc(100% + 4px); background:var(--tab-active); color:var(--fg);
-                   border:1px solid var(--border); border-radius:8px; padding:6px; min-width:190px;
-                   box-shadow:0 4px 16px rgba(0,0,0,0.35); z-index:10; }
-#bookmarks-menu.open { display:block; }
-#bookmarks-menu button { display:block; width:100%; text-align:left; background:none; border:none; color:var(--fg);
-                          padding:8px 10px; border-radius:6px; cursor:default; font-size:13px; }
-#bookmarks-menu button:hover { background:rgba(128,128,128,0.2); }
 </style></head>
 <body class="theme-dark">
 <div id="tabs"></div>
@@ -2267,11 +2302,11 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
   </div>
   <button id="settings" title="Settings">&#9881;</button>
   <div id="bookmarks-wrap">
+    <!-- The dropdown itself is a native GTK popup floated over the page via
+         GtkOverlay (see App::bookmarks_popup) -- a WebView can't render
+         content past its own fixed-height allocation, so an HTML dropdown
+         here could never truly layer on top of the page content below it. -->
     <button id="bookmarks" title="Bookmarks">&#8943;</button>
-    <div id="bookmarks-menu">
-      <button id="bm-toggle">Bookmark this page</button>
-      <button id="bm-manage">Manage bookmarks</button>
-    </div>
   </div>
   <div id="newtab" title="New Tab">+</div>
   <div id="dragregion"></div>
@@ -2364,31 +2399,13 @@ addressEl.addEventListener('keydown', function(e) {
 });
 addressEl.addEventListener('blur', function() { setTimeout(closeSuggestions, 100); });
 
-var bmMenu = document.getElementById('bookmarks-menu');
-// The menu is drawn inside the chrome WebView, which has a fixed native
-// height -- native grows that widget while the menu is open so there's
-// actually room to draw into (see update_chrome_height() / bmMenuOpen).
-function setBmMenuOpen(v) {
-  if (bmMenu.classList.contains('open') === v) return;
-  bmMenu.classList.toggle('open', v);
-  send(v ? 'bmMenuOpen' : 'bmMenuClose');
-}
+// The actual dropdown is a native GTK popup (see App::bookmarks_popup) --
+// this button just tells native to show/hide it.
 document.getElementById('bookmarks').addEventListener('click', function(e) {
   e.stopPropagation();
-  setBmMenuOpen(!bmMenu.classList.contains('open'));
+  send('bmMenuToggle');
 });
-document.addEventListener('click', function() { setBmMenuOpen(false); });
-document.getElementById('bm-toggle').addEventListener('click', function() {
-  setBmMenuOpen(false);
-  send('toggleBookmark');
-});
-document.getElementById('bm-manage').addEventListener('click', function() {
-  setBmMenuOpen(false);
-  send('openBookmarksTab');
-});
-
-var STR = { bm: 'Bookmark this page', rm: 'Remove bookmark' };
-var bookmarked = false;
+document.addEventListener('click', function() { send('bmMenuClose'); });
 
 // Tab order only ever matters visually -- native code always looks tabs up
 // by id, never by position -- so reordering is handled entirely here with
@@ -2466,19 +2483,9 @@ function photonSetAddress(url) {
 function photonSetLoading(loading) {
   document.getElementById('reload').innerHTML = loading ? '&#10005;' : '&#8635;';
 }
-function photonSetBookmarked(is) {
-  bookmarked = is;
-  document.getElementById('bm-toggle').textContent = is ? STR.rm : STR.bm;
-}
-function photonActivateTab(id, address, isBookmarked) {
+function photonActivateTab(id, address) {
   photonSetActiveTab(id);
   photonSetAddress(address);
-  photonSetBookmarked(isBookmarked);
-}
-function photonSetStrings(bm, rm, manage) {
-  STR.bm = bm; STR.rm = rm;
-  document.getElementById('bm-toggle').textContent = bookmarked ? rm : bm;
-  document.getElementById('bm-manage').textContent = manage;
 }
 var CUSTOM_VARS = ['--bg', '--bg2', '--tab-bg', '--tab-active', '--fg', '--fg-dim'];
 function photonSetTheme(theme, bgColor, fgColor) {
@@ -2529,7 +2536,6 @@ static void on_chrome_ready(WebKitWebView *view, WebKitLoadEvent event, gpointer
     g_signal_handlers_disconnect_by_func(view, (gpointer)on_chrome_ready, nullptr);
 
     push_chrome_theme();
-    push_chrome_strings();
     push_chrome_toolbar();
     push_chrome_tab_style();
 
@@ -2622,7 +2628,18 @@ int main(int argc, char **argv) {
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(vbox), chrome_widget, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), app->content_stack, TRUE, TRUE, 0);
-    gtk_container_add(GTK_CONTAINER(app->window), vbox);
+
+    // GtkOverlay so the bookmarks popup floats on top of the page content
+    // instead of having to grow the chrome WebView and push everything down
+    // -- see App::bookmarks_popup for why it has to be a native widget here.
+    GtkWidget *overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(overlay), vbox);
+    app->bookmarks_popup = build_bookmarks_popup();
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->bookmarks_popup);
+    gtk_widget_set_halign(app->bookmarks_popup, GTK_ALIGN_END);
+    gtk_widget_set_valign(app->bookmarks_popup, GTK_ALIGN_START);
+    gtk_container_add(GTK_CONTAINER(app->window), overlay);
+    update_chrome_height();  // now that the popup exists, sync its top margin too
 
     app->initial_uri = (argc > 1) ? to_uri(argv[1]) : home_uri();
 
