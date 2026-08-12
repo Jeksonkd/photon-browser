@@ -22,65 +22,36 @@ jobs:
 
       - name: Package AppImage
         run: |
-          mkdir -p PhotonBrowser.AppDir/usr/bin
-          cp photon-browser PhotonBrowser.AppDir/usr/bin/
-          cat > PhotonBrowser.AppDir/AppRun << 'EOF'
+          mkdir -p PhotonLight.AppDir/usr/bin
+          cp photon-light PhotonLight.AppDir/usr/bin/
+          cat > PhotonLight.AppDir/AppRun << 'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/photon-browser" "$@"
+          exec "$HERE/usr/bin/photon-light" "$@"
           EOF
-          chmod +x PhotonBrowser.AppDir/AppRun
-          cat > PhotonBrowser.AppDir/photon-browser.desktop << 'EOF'
+          chmod +x PhotonLight.AppDir/AppRun
+          cat > PhotonLight.AppDir/photon-light.desktop << 'EOF'
           [Desktop Entry]
           Type=Application
-          Name=Photon Browser
-          Exec=photon-browser
-          Icon=photon-browser
+          Name=Photon Light
+          Exec=photon-light
+          Icon=photon-light
           Categories=Network;WebBrowser;
           EOF
-          cp assets/logo.png PhotonBrowser.AppDir/photon-browser.png
+          cp assets/logo.png PhotonLight.AppDir/photon-light.png
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
-          ./appimagetool --appimage-extract-and-run PhotonBrowser.AppDir PhotonBrowser-x86_64.AppImage
+          ./appimagetool --appimage-extract-and-run PhotonLight.AppDir PhotonLight-x86_64.AppImage
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-artifacts
           path: |
-            photon-browser
-            PhotonBrowser-x86_64.AppImage
-
-  build-windows:
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: windows
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Restore WebView2 SDK
-        shell: pwsh
-        run: nuget install Microsoft.Web.WebView2 -Version 1.0.2739.15 -OutputDirectory packages -ExcludeVersion
-
-      - name: Build
-        shell: pwsh
-        run: |
-          $wv2 = "packages\Microsoft.Web.WebView2"
-          rc.exe /fo app.res app.rc
-          cl.exe /EHsc /std:c++17 /DUNICODE /D_UNICODE /I "$wv2\build\native\include" main.cpp `
-            /link /LIBPATH:"$wv2\build\native\x64" WebView2LoaderStatic.lib `
-            user32.lib gdi32.lib ole32.lib shell32.lib comctl32.lib app.res `
-            /OUT:PhotonBrowser.exe /SUBSYSTEM:WINDOWS
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-artifacts
-          path: windows/PhotonBrowser.exe
+            photon-light
+            PhotonLight-x86_64.AppImage
 
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -92,6 +63,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            linux-artifacts/photon-browser
-            linux-artifacts/PhotonBrowser-x86_64.AppImage
-            windows-artifacts/PhotonBrowser.exe
+            linux-artifacts/photon-light
+            linux-artifacts/PhotonLight-x86_64.AppImage

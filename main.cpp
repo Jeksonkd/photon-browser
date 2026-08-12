@@ -1,4 +1,7 @@
-// Photon Browser: a tiny native GTK3 + WebKitGTK browser.
+// Photon Light: a tiny native GTK3 + WebKitGTK browser, Linux only. This is
+// the WebKitGTK sibling of Photon Browser, which moved to a Chromium-based
+// engine -- Photon Light stays on WebKitGTK for a much smaller, simpler
+// binary with no bundled browser engine.
 //
 // The chrome (tab strip + toolbar + address bar) is an HTML/CSS/JS page
 // rendered in its own WebView, talking to native code via
@@ -185,7 +188,7 @@ struct Settings {
     std::vector<Extension> extensions;
 };
 
-static std::string config_dir() { return std::string(g_get_user_config_dir()) + "/photon-browser"; }
+static std::string config_dir() { return std::string(g_get_user_config_dir()) + "/photon-light"; }
 static std::string config_path() { return config_dir() + "/config.ini"; }
 
 static std::string detect_system_language() {
@@ -918,13 +921,13 @@ static void switch_to_tab(Tab *tab) {
 }
 
 static void update_window_title(Tab *tab) {
-    std::string title = "Photon Browser";
+    std::string title = "Photon Light";
     if (tab) {
         if (tab->view) {
             const gchar *t = webkit_web_view_get_title(tab->view);
-            if (t && *t) title = std::string(t) + " — Photon Browser";
+            if (t && *t) title = std::string(t) + " — Photon Light";
         } else {
-            title = std::string(tr(tab->internal_title, app->settings.language)) + " — Photon Browser";
+            title = std::string(tr(tab->internal_title, app->settings.language)) + " — Photon Light";
         }
     }
     gtk_window_set_title(GTK_WINDOW(app->window), title.c_str());
@@ -1605,7 +1608,7 @@ static void on_adblock_filter_ready(GObject *source, GAsyncResult *res, gpointer
 }
 
 static void compile_adblock_filter() {
-    std::string dir = std::string(g_get_home_dir()) + "/.local/share/photon-browser/filters";
+    std::string dir = std::string(g_get_home_dir()) + "/.local/share/photon-light/filters";
     g_mkdir_with_parents(dir.c_str(), 0700);
     app->filter_store = webkit_user_content_filter_store_new(dir.c_str());
     GBytes *bytes = g_bytes_new_static(ADBLOCK_RULES_JSON, strlen(ADBLOCK_RULES_JSON));
@@ -2937,7 +2940,7 @@ int main(int argc, char **argv) {
     app->settings = load_settings();
     app->http_session = soup_session_new();
 
-    std::string data_dir = std::string(g_get_home_dir()) + "/.local/share/photon-browser";
+    std::string data_dir = std::string(g_get_home_dir()) + "/.local/share/photon-light";
     std::string cache_dir = data_dir + "/cache";
     std::string data_subdir = data_dir + "/data";
     std::string cookie_path = data_dir + "/cookies.sqlite";
@@ -2957,7 +2960,7 @@ int main(int argc, char **argv) {
 
     app->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_default_size(GTK_WINDOW(app->window), 1100, 750);
-    gtk_window_set_title(GTK_WINDOW(app->window), "Photon Browser");
+    gtk_window_set_title(GTK_WINDOW(app->window), "Photon Light");
     // No native titlebar at all -- window controls (minimize/maximize/close) and
     // dragging live in the HTML chrome itself, so tabs+toolbar get the full
     // top of the window instead of sharing it with an empty GtkHeaderBar.
