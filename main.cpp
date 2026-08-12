@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -39,7 +41,8 @@ enum class Str {
     Appearance, Theme, ThemeLight, ThemeDark, ThemeCustom, CustomColor,
     OpenCookieEditor, Toolbar, Back, Forward, Reload, AddressBar, Size,
     TextColor, TabShape, Extensions, AddExtension, EditExtension, MatchPattern, ExtensionType,
-    Enabled, ManageExtensions, BlockAds, TabSize, RamSavingMode, ShowBookmarksBar
+    Enabled, ManageExtensions, BlockAds, TabSize, RamSavingMode, ShowBookmarksBar,
+    ToolbarIcon, MenuItems, MenuItemsHint
 };
 
 static const char *tr(Str key, const std::string &lang) {
@@ -99,6 +102,11 @@ static const char *tr(Str key, const std::string &lang) {
          {"RAM saving mode (locks hardware acceleration off)", "Режим экономии ОЗУ (аппаратное ускорение всегда выключено)"}},
         {Str::TabSize, {"Tab size", "Размер вкладок"}},
         {Str::ShowBookmarksBar, {"Show bookmarks bar", "Показывать панель закладок"}},
+        {Str::ToolbarIcon, {"Toolbar button (emoji/short text, empty = none)", "Кнопка на панели (эмодзи/короткий текст, пусто = нет кнопки)"}},
+        {Str::MenuItems, {"Menu", "Меню"}},
+        {Str::MenuItemsHint,
+         {"One control per line: button:id:label / checkbox:id:label:0|1 / slider:id:label:min:max:value",
+          "По одному элементу на строку: button:id:подпись / checkbox:id:подпись:0|1 / slider:id:подпись:мин:макс:значение"}},
     };
     int idx = (lang == "ru") ? 1 : 0;
     return table.at(key)[idx];
@@ -138,6 +146,23 @@ struct Extension {
     std::string type;   // "js" | "css"
     std::string code;
     bool enabled = true;
+
+    // A toolbar button + dropdown menu for the extension, both optional. The
+    // button only appears when toolbar_icon isn't empty. menu_dsl is one
+    // control per line -- see parse_extension_menu() for the exact syntax --
+    // rather than a structured format, since there's no visual menu builder;
+    // it's a plain-text field like match/code already are.
+    std::string toolbar_icon;
+    std::string menu_dsl;
+};
+
+struct ExtensionMenuItem {
+    std::string type;  // "button" | "checkbox" | "slider"
+    std::string id;     // sent back to the extension's own JS as the CustomEvent's `control`
+    std::string label;
+    double value = 0;   // checkbox: 0 or 1 initial state; slider: initial value
+    double min = 0;      // slider only
+    double max = 100;    // slider only
 };
 
 // -- settings persistence ----------------------------------------------
@@ -274,6 +299,12 @@ static Settings load_settings() {
             gboolean en = g_key_file_get_boolean(kf, group.c_str(), "enabled", &err);
             p.enabled = err ? true : bool(en);
             g_clear_error(&err);
+            v = g_key_file_get_string(kf, group.c_str(), "toolbar_icon", nullptr);
+            p.toolbar_icon = v ? v : "";
+            g_free(v);
+            v = g_key_file_get_string(kf, group.c_str(), "menu", nullptr);
+            p.menu_dsl = v ? v : "";
+            g_free(v);
             s.extensions.push_back(p);
         }
     }
@@ -323,6 +354,8 @@ static void save_settings(const Settings &s) {
         g_key_file_set_string(kf, group.c_str(), "type", p.type.c_str());
         g_key_file_set_string(kf, group.c_str(), "code", p.code.c_str());
         g_key_file_set_boolean(kf, group.c_str(), "enabled", p.enabled);
+        g_key_file_set_string(kf, group.c_str(), "toolbar_icon", p.toolbar_icon.c_str());
+        g_key_file_set_string(kf, group.c_str(), "menu", p.menu_dsl.c_str());
     }
 
     std::vector<const char *> burls, btitles;
@@ -385,6 +418,14 @@ struct App {
     GtkWidget *bookmarks_manage_btn = nullptr;
     bool bookmarks_popup_open = false;
 
+    // Same native-GtkOverlay-popup approach as bookmarks_popup, but generic:
+    // its contents are torn down and rebuilt from scratch every time it
+    // opens, for whichever extension's toolbar button was clicked (there's
+    // no per-extension popup instance, since the extension list is dynamic).
+    GtkWidget *ext_popup = nullptr;
+    bool ext_popup_open = false;
+    int ext_popup_index = -1;  // index into settings.extensions of the currently-shown menu
+
     GtkWidget *settings_scroller = nullptr;  // stable container; contents are fully rebuilt on any change
     GtkWidget *settings_status_label = nullptr;
 
@@ -446,6 +487,10 @@ static void apply_adblock_to_view(WebKitWebView *view);
 static void apply_adblock_to_all_tabs();
 static void update_chrome_height();
 static void push_bookmarks_bar();
+static void push_extension_buttons();
+static void open_extension_menu(int index, int x);
+static void close_extension_menu();
+static void toggle_extension_menu(int index, int x);
 static void fetch_suggestions(const std::string &query);
 
 // -- generic helpers --------------------------------------------------------------
@@ -455,6 +500,50 @@ static std::string trim(const std::string &s) {
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
+}
+
+// menu_dsl syntax, one control per line:
+//   button:id:label
+//   checkbox:id:label:0|1          (initial state)
+//   slider:id:label:min:max:value  (initial value)
+// Malformed lines are silently skipped -- this is a power-user text field,
+// not validated input, consistent with the match pattern / code fields.
+static std::vector<ExtensionMenuItem> parse_extension_menu(const std::string &dsl) {
+    std::vector<ExtensionMenuItem> items;
+    std::istringstream stream(dsl);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        std::vector<std::string> parts;
+        size_t start = 0;
+        while (true) {
+            size_t colon = line.find(':', start);
+            parts.push_back(line.substr(start, colon == std::string::npos ? std::string::npos : colon - start));
+            if (colon == std::string::npos) break;
+            start = colon + 1;
+        }
+        ExtensionMenuItem it;
+        it.type = parts[0];
+        if (it.type == "button" && parts.size() >= 3) {
+            it.id = parts[1];
+            it.label = parts[2];
+            items.push_back(it);
+        } else if (it.type == "checkbox" && parts.size() >= 4) {
+            it.id = parts[1];
+            it.label = parts[2];
+            it.value = (trim(parts[3]) == "1") ? 1 : 0;
+            items.push_back(it);
+        } else if (it.type == "slider" && parts.size() >= 6) {
+            it.id = parts[1];
+            it.label = parts[2];
+            it.min = atof(parts[3].c_str());
+            it.max = atof(parts[4].c_str());
+            it.value = atof(parts[5].c_str());
+            items.push_back(it);
+        }
+    }
+    return items;
 }
 
 static const SearchEngine &current_engine() {
@@ -984,6 +1073,11 @@ static void on_chrome_message(WebKitUserContentManager *, WebKitJavascriptResult
         toggle_bookmarks_popup();
     } else if (msg == "bmMenuClose") {
         close_bookmarks_popup();
+    } else if (starts_with("extMenuToggle:")) {
+        int idx = 0, x = 0;
+        if (sscanf(msg.c_str() + 14, "%d:%d", &idx, &x) == 2) toggle_extension_menu(idx, x);
+    } else if (msg == "extMenuClose") {
+        close_extension_menu();
     } else if (starts_with("switchTab:")) {
         if (Tab *t = find_tab_by_id(atoi(msg.c_str() + 10))) switch_to_tab(t);
     } else if (starts_with("closeTab:")) {
@@ -1582,12 +1676,131 @@ static void apply_extensions_to_all_tabs() {
     if (app->spare_tab && app->spare_tab->view) apply_extensions_to_view(app->spare_tab->view);
 }
 
+// -- extension toolbar buttons / menus -------------------------------------
+//
+// An extension's own JS only ever runs inside page WebViews, never in the
+// chrome or in native code, so there's no function pointer or callback to
+// invoke when a menu control is used. Instead, native dispatches a
+// CustomEvent into the *active tab's page* -- the extension's own injected
+// script (written by whoever authored the extension) listens for it:
+//   window.addEventListener('photon-ext-action', e => {
+//     if (e.detail.control === 'myCheckbox') { ... e.detail.value ... }
+//   });
+static void dispatch_extension_action(int ext_index, const std::string &control_id, const std::string &value_js) {
+    if (ext_index < 0 || size_t(ext_index) >= app->settings.extensions.size()) return;
+    Tab *tab = current_tab();
+    if (!tab || !tab->view) return;
+    std::string js = "window.dispatchEvent(new CustomEvent('photon-ext-action',{detail:{extension:" +
+                      js_string_literal(app->settings.extensions[ext_index].name) + ",control:" +
+                      js_string_literal(control_id) + ",value:" + value_js + "}}));";
+    webkit_web_view_evaluate_javascript(tab->view, js.c_str(), -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+static void on_ext_menu_button_clicked(GtkButton *, gpointer user_data) {
+    dispatch_extension_action(app->ext_popup_index, static_cast<const char *>(user_data), "true");
+    close_extension_menu();
+}
+
+static void on_ext_menu_checkbox_toggled(GtkToggleButton *btn, gpointer user_data) {
+    dispatch_extension_action(app->ext_popup_index, static_cast<const char *>(user_data),
+                               gtk_toggle_button_get_active(btn) ? "true" : "false");
+}
+
+static void on_ext_menu_slider_changed(GtkRange *range, gpointer user_data) {
+    dispatch_extension_action(app->ext_popup_index, static_cast<const char *>(user_data),
+                               std::to_string(gtk_range_get_value(range)));
+}
+
+static GtkWidget *build_ext_popup() {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_style_context_add_class(gtk_widget_get_style_context(box), "bookmarks-popup");
+    gtk_widget_set_size_request(box, 220, -1);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    gtk_widget_set_no_show_all(box, TRUE);
+    gtk_widget_hide(box);
+    return box;
+}
+
+// Contents are rebuilt from scratch every open (unlike the static bookmarks
+// popup) since they depend on which extension's button was clicked. Each
+// freshly-built child is shown individually with show_all() -- the popup
+// container itself has no_show_all set (so main()'s window-wide show_all()
+// doesn't pop it open at startup), and show_all() on a no_show_all widget is
+// a complete no-op on itself *and* everything under it, so it can't be used
+// to reveal new children through the container; a plain show() on the
+// container is what actually reveals it, same as the bookmarks popup.
+static void open_extension_menu(int index, int x) {
+    if (index < 0 || size_t(index) >= app->settings.extensions.size()) return;
+    clear_container(app->ext_popup);
+    for (const ExtensionMenuItem &item : parse_extension_menu(app->settings.extensions[index].menu_dsl)) {
+        GtkWidget *child = nullptr;
+        if (item.type == "button") {
+            child = gtk_button_new_with_label(item.label.c_str());
+            left_align_button_label(child);
+            connect_with_id(child, "clicked", G_CALLBACK(on_ext_menu_button_clicked), item.id);
+        } else if (item.type == "checkbox") {
+            child = gtk_check_button_new_with_label(item.label.c_str());
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(child), item.value != 0);
+            connect_with_id(child, "toggled", G_CALLBACK(on_ext_menu_checkbox_toggled), item.id);
+        } else if (item.type == "slider") {
+            child = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+            GtkWidget *label = gtk_label_new(item.label.c_str());
+            gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+            GtkWidget *scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, item.min, item.max, 1);
+            gtk_range_set_value(GTK_RANGE(scale), item.value);
+            connect_with_id(scale, "value-changed", G_CALLBACK(on_ext_menu_slider_changed), item.id);
+            gtk_box_pack_start(GTK_BOX(child), label, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(child), scale, FALSE, FALSE, 0);
+        } else {
+            continue;
+        }
+        gtk_box_pack_start(GTK_BOX(app->ext_popup), child, FALSE, FALSE, 0);
+        gtk_widget_show_all(child);
+    }
+    gtk_widget_set_margin_start(app->ext_popup, x);
+    app->ext_popup_index = index;
+    app->ext_popup_open = true;
+    gtk_widget_show(app->ext_popup);
+}
+
+static void close_extension_menu() {
+    if (!app->ext_popup || !app->ext_popup_open) return;
+    app->ext_popup_open = false;
+    app->ext_popup_index = -1;
+    gtk_widget_hide(app->ext_popup);
+}
+
+static void toggle_extension_menu(int index, int x) {
+    if (app->ext_popup_open && app->ext_popup_index == index) {
+        close_extension_menu();
+    } else {
+        close_extension_menu();
+        open_extension_menu(index, x);
+    }
+}
+
+static void push_extension_buttons() {
+    std::string items = "[";
+    bool first = true;
+    for (size_t i = 0; i < app->settings.extensions.size(); ++i) {
+        const Extension &e = app->settings.extensions[i];
+        if (!e.enabled || e.toolbar_icon.empty()) continue;
+        if (!first) items += ",";
+        first = false;
+        items += "{\"index\":" + std::to_string(i) + ",\"icon\":" + js_string_literal(e.toolbar_icon) + "}";
+    }
+    items += "]";
+    run_chrome_js("photonSetExtensionButtons(" + items + ")");
+}
+
 static void on_extension_enabled_toggled(GtkToggleButton *btn, gpointer user_data) {
     int idx = GPOINTER_TO_INT(user_data);
     if (idx < 0 || idx >= int(app->settings.extensions.size())) return;
     app->settings.extensions[idx].enabled = gtk_toggle_button_get_active(btn);
     save_settings(app->settings);
     apply_extensions_to_all_tabs();
+    close_extension_menu();  // avoid a stale menu for a now-toggled extension
+    push_extension_buttons();
 }
 
 static void on_extension_delete_clicked(GtkButton *, gpointer user_data) {
@@ -1597,6 +1810,8 @@ static void on_extension_delete_clicked(GtkButton *, gpointer user_data) {
     save_settings(app->settings);
     apply_extensions_to_all_tabs();
     refresh_extensions_ui();
+    close_extension_menu();  // indices shifted; avoid pointing at the wrong extension
+    push_extension_buttons();
 }
 
 struct ExtensionDialogCtx {
@@ -1606,6 +1821,8 @@ struct ExtensionDialogCtx {
     GtkWidget *type_combo;
     GtkWidget *code_view;
     GtkWidget *enabled_check;
+    GtkWidget *icon_entry;
+    GtkWidget *menu_view;
 };
 
 static void on_extension_dialog_response(GtkDialog *dialog, gint response, gpointer user_data) {
@@ -1624,6 +1841,14 @@ static void on_extension_dialog_response(GtkDialog *dialog, gint response, gpoin
         p.code = code ? code : "";
         g_free(code);
         p.enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx->enabled_check));
+        p.toolbar_icon = gtk_entry_get_text(GTK_ENTRY(ctx->icon_entry));
+        GtkTextBuffer *menu_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->menu_view));
+        GtkTextIter mstart, mend;
+        gtk_text_buffer_get_start_iter(menu_buf, &mstart);
+        gtk_text_buffer_get_end_iter(menu_buf, &mend);
+        gchar *menu = gtk_text_buffer_get_text(menu_buf, &mstart, &mend, FALSE);
+        p.menu_dsl = menu ? menu : "";
+        g_free(menu);
 
         if (!p.name.empty()) {
             if (ctx->index >= 0 && ctx->index < int(app->settings.extensions.size())) {
@@ -1634,6 +1859,8 @@ static void on_extension_dialog_response(GtkDialog *dialog, gint response, gpoin
             save_settings(app->settings);
             apply_extensions_to_all_tabs();
             refresh_extensions_ui();
+            close_extension_menu();
+            push_extension_buttons();
         }
     }
     delete ctx;
@@ -1647,7 +1874,7 @@ static void open_extension_dialog(int index) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons(
         tr(editing ? Str::EditExtension : Str::AddExtension, lang), GTK_WINDOW(app->window), GTK_DIALOG_MODAL,
         tr(Str::Cancel, lang), GTK_RESPONSE_CANCEL, tr(Str::Save, lang), GTK_RESPONSE_OK, nullptr);
-    gtk_window_set_default_size(GTK_WINDOW(dialog), 480, 420);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 480, 560);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -1695,6 +1922,35 @@ static void open_extension_dialog(int index) {
     }
     gtk_container_add(GTK_CONTAINER(code_scroller), ctx->code_view);
     gtk_box_pack_start(GTK_BOX(box), code_scroller, TRUE, TRUE, 0);
+
+    GtkWidget *icon_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(icon_row), gtk_label_new(tr(Str::ToolbarIcon, lang)), FALSE, FALSE, 0);
+    ctx->icon_entry = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(ctx->icon_entry), 8);
+    gtk_widget_set_size_request(ctx->icon_entry, 60, -1);
+    if (editing) gtk_entry_set_text(GTK_ENTRY(ctx->icon_entry), app->settings.extensions[index].toolbar_icon.c_str());
+    gtk_box_pack_start(GTK_BOX(icon_row), ctx->icon_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), icon_row, FALSE, FALSE, 0);
+
+    GtkWidget *menu_hint = gtk_label_new(tr(Str::MenuItemsHint, lang));
+    gtk_label_set_xalign(GTK_LABEL(menu_hint), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(menu_hint), TRUE);
+    PangoAttrList *hint_attrs = pango_attr_list_new();
+    pango_attr_list_insert(hint_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+    gtk_label_set_attributes(GTK_LABEL(menu_hint), hint_attrs);
+    pango_attr_list_unref(hint_attrs);
+    gtk_box_pack_start(GTK_BOX(box), gtk_label_new(tr(Str::MenuItems, lang)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), menu_hint, FALSE, FALSE, 0);
+    GtkWidget *menu_scroller = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_widget_set_size_request(menu_scroller, -1, 90);
+    ctx->menu_view = gtk_text_view_new();
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(ctx->menu_view), TRUE);
+    if (editing) {
+        GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->menu_view));
+        gtk_text_buffer_set_text(buf, app->settings.extensions[index].menu_dsl.c_str(), -1);
+    }
+    gtk_container_add(GTK_CONTAINER(menu_scroller), ctx->menu_view);
+    gtk_box_pack_start(GTK_BOX(box), menu_scroller, FALSE, FALSE, 0);
 
     gtk_container_add(GTK_CONTAINER(content), box);
     gtk_widget_show_all(dialog);
@@ -1892,6 +2148,7 @@ static void update_chrome_height() {
     if (bookmarks_bar_visible()) height += BOOKMARKS_BAR_HEIGHT;
     gtk_widget_set_size_request(GTK_WIDGET(app->chrome_view), -1, height);
     if (app->bookmarks_popup) gtk_widget_set_margin_top(app->bookmarks_popup, height);
+    if (app->ext_popup) gtk_widget_set_margin_top(app->ext_popup, height);
 }
 
 static void push_bookmarks_bar() {
@@ -2355,6 +2612,7 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
 .suggest-item { padding:8px 12px; font-size:13px; color:var(--fg); white-space:nowrap; overflow:hidden;
                 text-overflow:ellipsis; cursor:default; }
 .suggest-item:hover, .suggest-item.active { background:rgba(128,128,128,0.25); }
+#ext-buttons { display:flex; align-items:center; gap:2px; }
 #bookmarks-wrap { position:relative; }
 #bookmarks-bar { display:none; align-items:center; gap:4px; height:30px; padding:0 8px; overflow-x:auto;
                   background:var(--bg2); border-top:1px solid var(--border); white-space:nowrap; }
@@ -2374,6 +2632,10 @@ html,body { margin:0; padding:0; height:100%; overflow:hidden; background:var(--
     <div id="suggestions"></div>
   </div>
   <button id="settings" title="Settings">&#9881;</button>
+  <!-- One button per extension that has a toolbar_icon set -- populated by
+       photonSetExtensionButtons(). Its menu is a native GTK popup (see
+       App::ext_popup), same reasoning as the bookmarks dropdown. -->
+  <div id="ext-buttons"></div>
   <div id="bookmarks-wrap">
     <!-- The dropdown itself is a native GTK popup floated over the page via
          GtkOverlay (see App::bookmarks_popup) -- a WebView can't render
@@ -2479,7 +2741,24 @@ document.getElementById('bookmarks').addEventListener('click', function(e) {
   e.stopPropagation();
   send('bmMenuToggle');
 });
-document.addEventListener('click', function() { send('bmMenuClose'); });
+document.addEventListener('click', function() { send('bmMenuClose'); send('extMenuClose'); });
+
+// Same native-popup approach as bookmarks -- see App::ext_popup. The button's
+// own x position is sent along so the popup can anchor under it.
+function photonSetExtensionButtons(items) {
+  var wrap = document.getElementById('ext-buttons');
+  wrap.innerHTML = '';
+  items.forEach(function(it) {
+    var btn = document.createElement('button');
+    btn.textContent = it.icon;
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var r = btn.getBoundingClientRect();
+      send('extMenuToggle:' + it.index + ':' + Math.round(r.left));
+    });
+    wrap.appendChild(btn);
+  });
+}
 
 // Tab order only ever matters visually -- native code always looks tabs up
 // by id, never by position -- so reordering is handled entirely here with
@@ -2626,6 +2905,7 @@ static void on_chrome_ready(WebKitWebView *view, WebKitLoadEvent event, gpointer
     push_chrome_toolbar();
     push_chrome_tab_style();
     push_bookmarks_bar();
+    push_extension_buttons();
 
     // The very first tab must be created here, not in main(): main() calls
     // this before gtk_main() has pumped a single event, so the chrome's own
@@ -2722,8 +3002,16 @@ int main(int argc, char **argv) {
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->bookmarks_popup);
     gtk_widget_set_halign(app->bookmarks_popup, GTK_ALIGN_END);
     gtk_widget_set_valign(app->bookmarks_popup, GTK_ALIGN_START);
+    // Extension menus anchor to their button's actual x position (set per-open
+    // via margin_start in open_extension_menu()), not a fixed corner like the
+    // bookmarks popup, since there can be several extension buttons anywhere
+    // in the toolbar.
+    app->ext_popup = build_ext_popup();
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->ext_popup);
+    gtk_widget_set_halign(app->ext_popup, GTK_ALIGN_START);
+    gtk_widget_set_valign(app->ext_popup, GTK_ALIGN_START);
     gtk_container_add(GTK_CONTAINER(app->window), overlay);
-    update_chrome_height();  // now that the popup exists, sync its top margin too
+    update_chrome_height();  // now that the popups exist, sync their top margin too
 
     app->initial_uri = (argc > 1) ? to_uri(argv[1]) : home_uri();
 
