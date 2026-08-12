@@ -2151,6 +2151,14 @@ static void update_chrome_height() {
     int height = app->settings.tab_height + app->settings.toolbar_size + 14;
     if (bookmarks_bar_visible()) height += BOOKMARKS_BAR_HEIGHT;
     gtk_widget_set_size_request(GTK_WIDGET(app->chrome_view), -1, height);
+    // Shrinking the request alone isn't reliably enough to make the WebView's
+    // own GPU-composited surface actually repaint at the new size -- without
+    // this, deleting the last bookmark (or shrinking toolbar_size) left the
+    // old, larger frame's pixels visible in what's now supposed to be dead
+    // space, eating into the page content area below. Only became visible
+    // once hardware acceleration got turned back on (see apply_lightweight_settings);
+    // software rendering always redrew on resize regardless.
+    gtk_widget_queue_resize(GTK_WIDGET(app->chrome_view));
     if (app->bookmarks_popup) gtk_widget_set_margin_top(app->bookmarks_popup, height);
     if (app->ext_popup) gtk_widget_set_margin_top(app->ext_popup, height);
 }
