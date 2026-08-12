@@ -22,33 +22,33 @@ jobs:
 
       - name: Package AppImage
         run: |
-          mkdir -p PhotonLight.AppDir/usr/bin
-          cp photon-light PhotonLight.AppDir/usr/bin/
-          cat > PhotonLight.AppDir/AppRun << 'EOF'
+          mkdir -p PhotonBrowser.AppDir/usr/bin
+          cp photon-browser PhotonBrowser.AppDir/usr/bin/
+          cat > PhotonBrowser.AppDir/AppRun << 'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/photon-light" "$@"
+          exec "$HERE/usr/bin/photon-browser" "$@"
           EOF
-          chmod +x PhotonLight.AppDir/AppRun
-          cat > PhotonLight.AppDir/photon-light.desktop << 'EOF'
+          chmod +x PhotonBrowser.AppDir/AppRun
+          cat > PhotonBrowser.AppDir/photon-browser.desktop << 'EOF'
           [Desktop Entry]
           Type=Application
-          Name=Photon Light
-          Exec=photon-light
-          Icon=photon-light
+          Name=Photon Browser
+          Exec=photon-browser
+          Icon=photon-browser
           Categories=Network;WebBrowser;
           EOF
-          cp assets/logo.png PhotonLight.AppDir/photon-light.png
+          cp assets/logo.png PhotonBrowser.AppDir/photon-browser.png
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
-          ./appimagetool --appimage-extract-and-run PhotonLight.AppDir PhotonLight-x86_64.AppImage
+          ./appimagetool --appimage-extract-and-run PhotonBrowser.AppDir PhotonBrowser-x86_64.AppImage
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-artifacts
           path: |
-            photon-light
-            PhotonLight-x86_64.AppImage
+            photon-browser
+            PhotonBrowser-x86_64.AppImage
 
   release:
     needs: [build-linux]
@@ -63,5 +63,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            linux-artifacts/photon-light
-            linux-artifacts/PhotonLight-x86_64.AppImage
+            linux-artifacts/photon-browser
+            linux-artifacts/PhotonBrowser-x86_64.AppImage
