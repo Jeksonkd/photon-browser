@@ -594,11 +594,14 @@ static void run_chrome_js(const std::string &code) {
 // (WebKit's adaptive default) otherwise, so the GPU is used exactly when a
 // page needs it for smooth compositing.
 //
-// Page cache stays disabled: don't hold fully-rendered previous pages in
-// memory for instant back/forward (back/forward does a real reload instead).
+// Page cache (WebKit's equivalent of Firefox's bfcache) used to be force-
+// disabled unconditionally too, for the same reason and with the same fix:
+// only actually off under RAM saving mode. Off, every back/forward reloads
+// the page from scratch instead of instantly restoring the already-rendered
+// one -- a big part of why navigation felt slower than other browsers.
 static void apply_lightweight_settings(WebKitWebView *view) {
     WebKitSettings *settings = webkit_web_view_get_settings(view);
-    webkit_settings_set_enable_page_cache(settings, FALSE);
+    webkit_settings_set_enable_page_cache(settings, !app->settings.ram_saving_mode);
     webkit_settings_set_hardware_acceleration_policy(
         settings, app->settings.ram_saving_mode ? WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER
                                                   : WEBKIT_HARDWARE_ACCELERATION_POLICY_ON_DEMAND);
@@ -610,6 +613,17 @@ static void apply_lightweight_settings_to_all_tabs() {
     }
     if (app->spare_tab && app->spare_tab->view) apply_lightweight_settings(app->spare_tab->view);
     if (app->chrome_view) apply_lightweight_settings(app->chrome_view);
+}
+
+// Same RAM-vs-speed trade-off as apply_lightweight_settings(): WEB_BROWSER
+// caches far more subresources and previously visited pages than
+// DOCUMENT_BROWSER, so repeat visits and cross-page navigation load
+// noticeably faster -- only worth giving up under RAM saving mode.
+static void update_cache_model() {
+    if (!app->web_context) return;
+    webkit_web_context_set_cache_model(app->web_context, app->settings.ram_saving_mode
+                                                               ? WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER
+                                                               : WEBKIT_CACHE_MODEL_WEB_BROWSER);
 }
 
 // -- tab navigation/state callbacks ---------------------------------------
@@ -1516,6 +1530,7 @@ static void on_ram_saving_toggled(GtkToggleButton *btn, gpointer) {
     app->settings.ram_saving_mode = gtk_toggle_button_get_active(btn);
     save_settings(app->settings);
     apply_lightweight_settings_to_all_tabs();
+    update_cache_model();
 }
 
 static void on_show_bookmarks_bar_toggled(GtkToggleButton *btn, gpointer) {
@@ -2655,11 +2670,7 @@ int main(int argc, char **argv) {
                                                   WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
     app->web_context = webkit_web_context_new_with_website_data_manager(app->data_manager);
     webkit_web_context_set_favicon_database_directory(app->web_context, favicon_dir.c_str());
-    // DOCUMENT_BROWSER caches a moderate number of resources instead of the
-    // default WEB_BROWSER model's "cache a very large number of resources
-    // and previously viewed content" -- meaningfully lower memory at the
-    // cost of a bit more re-fetching on repeat visits.
-    webkit_web_context_set_cache_model(app->web_context, WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
+    update_cache_model();
     compile_adblock_filter();
 
     apply_theme();
